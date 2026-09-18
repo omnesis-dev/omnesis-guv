@@ -66,6 +66,19 @@ guv status   # must show: handler ok
 Or hand the whole procedure to an agent via
 `skills/omnesis-guv-setup/SKILL.md`.
 
+## Troubleshooting
+
+- `Cannot find package 'zod'` at handler startup: Bun resolves the
+  file:-installed SDK by real path, outside this checkout. Keep `zod`
+  (pinned in `package.json`) installed here and launch with
+  `NODE_PATH=<checkout>/node_modules` — the systemd unit in the setup
+  skill does this.
+- `guv status` shows `handler ok` but the app reports failures: every
+  handler-side failure is returned as visible text naming the cause, so
+  read the reply — a 401/403 reply walks through re-pairing.
+- `auth FAILED ... 401`: the Familiar pairing, independent of Omnesis.
+  Run `guv setup` (may need the phone app) before any Job can arrive.
+
 ## Tests
 
 ```sh
