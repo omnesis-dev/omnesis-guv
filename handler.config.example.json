@@ -1,0 +1,6 @@
+{
+  "command": ["bun", "src/handler.ts"],
+  "cwd": ".",
+  "timeout_ms": 300000,
+  "max_concurrency": 4
+}

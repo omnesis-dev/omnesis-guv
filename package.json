@@ -1,0 +1,11 @@
+{
+  "name": "omnesis-guv",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "Guv handler that answers Jobs through the Omnesis /answer API",
+  "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "handler": "bun src/handler.ts"
+  }
+}
