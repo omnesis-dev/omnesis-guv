@@ -72,7 +72,8 @@ Without the Omnesis CLI:
 ```sh
 (umask 077; curl -sS --fail-with-body -X POST https://<gateway>:7600/devices/pair \
   -H 'Content-Type: application/json' -d '{"pairingCode":"<code>"}' |
-  jq -er .token > ~/.config/omnesis/guv.token)
+  jq -er .token > ~/.config/omnesis/guv.token.new &&
+  mv ~/.config/omnesis/guv.token.new ~/.config/omnesis/guv.token)
 ```
 
 ### 4. Prove the integration answers before touching Guv

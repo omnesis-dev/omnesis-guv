@@ -91,6 +91,16 @@ describe("AnswerClient.submit", () => {
     expect((error as Error).message).toBe("The Omnesis gateway address redirects to http://elsewhere.example.org.");
   });
 
+  test("a redirect names only a target it can resolve", async () => {
+    const redirect = (location?: string) =>
+      failure(respond("", { status: 302, headers: location === undefined ? {} : { location } }));
+    expect(((await redirect("/elsewhere")) as Error).message).toBe(
+      "The Omnesis gateway address redirects to https://gateway.example.org:7600.",
+    );
+    expect(((await redirect()) as Error).message).toBe("The Omnesis gateway address redirects.");
+    expect(((await redirect("http://[bad")) as Error).message).toBe("The Omnesis gateway address redirects.");
+  });
+
   test("a network failure is unreachable, naming the address and the code but never the request", async () => {
     const error = await failure(async () => {
       throw Object.assign(new TypeError("Header 'Authorization' has invalid value: 'Bearer omn_secret'"), {

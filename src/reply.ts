@@ -49,7 +49,11 @@ export function answerReply(response: AnswerResponse): HandlerResult {
         "Omnesis held this answer for approval, which Guv cannot give. Read it in Omnesis once you approve it.",
       );
     case "denied":
-      return textReply(DENIALS[response.reason] ?? "Omnesis did not release an answer to this question.");
+      return textReply(
+        Object.hasOwn(DENIALS, response.reason)
+          ? DENIALS[response.reason]!
+          : "Omnesis did not release an answer to this question.",
+      );
   }
 }
 

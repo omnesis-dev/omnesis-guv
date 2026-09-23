@@ -6,7 +6,7 @@ import {
   type AnswerRequest,
   type AnswerResponse,
 } from "../src/answer-client.js";
-import { AnswerDeadlineError, ask, requestIdFor, UNREACHABLE_GIVE_UP_MS, type AskDeps } from "../src/ask.js";
+import { AnswerDeadlineError, ask, requestIdFor, OUTAGE_GIVE_UP_MS, type AskDeps } from "../src/ask.js";
 
 const RELEASED: AnswerResponse = { status: "released", taskId: "task_1", answer: "Yes." };
 
@@ -108,8 +108,8 @@ describe("ask", () => {
     const error = await ask("q", "job-7", 240_000, deps).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(GatewayUnreachableError);
     // The last attempt starts exactly when the outage reaches its limit.
-    expect(elapsed()).toBeGreaterThanOrEqual(UNREACHABLE_GIVE_UP_MS);
-    expect(elapsed()).toBeLessThanOrEqual(UNREACHABLE_GIVE_UP_MS + 2 * 1_000);
+    expect(elapsed()).toBeGreaterThanOrEqual(OUTAGE_GIVE_UP_MS);
+    expect(elapsed()).toBeLessThanOrEqual(OUTAGE_GIVE_UP_MS + 2 * 1_000);
   });
 
   test("waits out a proxy answering for a gateway that is restarting or slow", async () => {
@@ -138,10 +138,31 @@ describe("ask", () => {
     expect(await ask("q", "job-7", 20_000, deps).catch((e: unknown) => e)).toMatchObject({ waitingOn: "answer" });
   });
 
-  test("an attempt that hangs after the gateway went unreachable is reported as the gateway", async () => {
+  test("an attempt still running at the deadline after an outage is reported as a slow answer", async () => {
+    // The gateway came back and accepted the question; it was answering, not down.
     const { deps } = scripted([unreachable(), HANG]);
     const error = await ask("q", "job-7", 20_000, deps).catch((e: unknown) => e);
+    expect(error).toMatchObject({ name: "AnswerDeadlineError", waitingOn: "answer" });
+  });
+
+  test("a deadline that falls during a pause after an outage is reported as the gateway", async () => {
+    const { deps } = scripted(Array.from({ length: 5 }, unreachable), 4_000);
+    const error = await ask("q", "job-7", 10_000, deps).catch((e: unknown) => e);
     expect(error).toMatchObject({ name: "AnswerDeadlineError", waitingOn: "gateway" });
+  });
+
+  test("a gateway that stays unavailable is reported with its last answer, whatever mix the outage was", async () => {
+    const outage = [
+      unreachable(),
+      new AnswerHttpError(502, undefined, "Bad Gateway"),
+      new AnswerHttpError(503, "GATEWAY_SHUTTING_DOWN", "Gateway is shutting down"),
+      ...Array.from({ length: 20 }, () => new AnswerHttpError(502, undefined, "Bad Gateway")),
+    ];
+    const { deps, elapsed } = scripted(outage, 1_000);
+    const error = await ask("q", "job-7", 240_000, deps).catch((e: unknown) => e);
+    expect(error).toMatchObject({ name: "AnswerHttpError", status: 502, code: undefined });
+    expect(elapsed()).toBeGreaterThanOrEqual(OUTAGE_GIVE_UP_MS);
+    expect(elapsed()).toBeLessThanOrEqual(OUTAGE_GIVE_UP_MS + 2 * 1_000);
   });
 
   test("an outage clock restarts once the gateway answers again", async () => {

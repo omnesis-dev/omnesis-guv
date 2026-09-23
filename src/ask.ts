@@ -11,11 +11,12 @@ const FIRST_RETRY_DELAY_MS = 1_000;
 const MAX_RETRY_DELAY_MS = 10_000;
 
 /**
- * How long the gateway may stay unreachable before the Job reports it. A
- * restart or a network blip is over well within this; a gateway that is down
- * is better reported now than at the end of the whole time budget.
+ * How long the gateway may stay unavailable (see `isGatewayOutage`) before the
+ * Job reports it. A restart or a network blip is over well within this; a
+ * gateway that is down is better reported now than at the end of the whole
+ * time budget.
  */
-export const UNREACHABLE_GIVE_UP_MS = 30_000;
+export const OUTAGE_GIVE_UP_MS = 30_000;
 
 /** Proxy statuses that mean the gateway behind it is restarting, down, or slow to answer. */
 const PROXY_GAP_STATUSES: ReadonlySet<number> = new Set([502, 503, 504]);
@@ -75,7 +76,7 @@ export async function ask(question: string, jobId: string, budgetMs: number, dep
   const request = { question, clientRequestId: requestIdFor(jobId) };
   let delay = FIRST_RETRY_DELAY_MS;
   let reaskedAfterAccessChange = false;
-  let unreachableSince: number | undefined;
+  let outageSince: number | undefined;
   let waitingOn: DeadlineWait = "answer";
   for (;;) {
     const remaining = deadline - deps.now();
@@ -84,23 +85,24 @@ export async function ask(question: string, jobId: string, budgetMs: number, dep
     try {
       return await deps.client.submit(request, signal);
     } catch (error) {
-      if (signal.aborted) throw new AnswerDeadlineError(budgetMs, waitingOn === "gateway" ? "gateway" : "answer");
+      // An attempt still running at the deadline had reached a gateway that was answering.
+      if (error === signal.reason) throw new AnswerDeadlineError(budgetMs, "answer");
       if (error instanceof AnswerHttpError && error.code === "ANSWER_ACCESS_CHANGED" && !reaskedAfterAccessChange) {
         // The integration's access level changed while the answer was being
         // made, so the gateway withheld it. The same request id asks again
         // under the new level — once: a second change is left to the person.
         reaskedAfterAccessChange = true;
-        unreachableSince = undefined;
+        outageSince = undefined;
         waitingOn = "answer";
         continue;
       }
       if (isGatewayOutage(error)) {
         waitingOn = "gateway";
-        unreachableSince ??= deps.now();
-        if (deps.now() - unreachableSince >= UNREACHABLE_GIVE_UP_MS) throw error;
+        outageSince ??= deps.now();
+        if (deps.now() - outageSince >= OUTAGE_GIVE_UP_MS) throw error;
       } else if (error instanceof AnswerHttpError && error.code !== undefined && TRANSIENT_CODES.has(error.code)) {
         waitingOn = error.code === "ANSWER_IN_PROGRESS" ? "answer" : "capacity";
-        unreachableSince = undefined;
+        outageSince = undefined;
       } else {
         throw error;
       }
@@ -108,7 +110,7 @@ export async function ask(question: string, jobId: string, budgetMs: number, dep
     const now = deps.now();
     let wait = Math.min(delay, deadline - now);
     // Try once more exactly when the outage reaches its limit, not a full pause later.
-    if (unreachableSince !== undefined) wait = Math.min(wait, unreachableSince + UNREACHABLE_GIVE_UP_MS - now);
+    if (outageSince !== undefined) wait = Math.min(wait, outageSince + OUTAGE_GIVE_UP_MS - now);
     if (wait > 0) await deps.sleep(wait);
     delay = Math.min(delay * 2, MAX_RETRY_DELAY_MS);
   }

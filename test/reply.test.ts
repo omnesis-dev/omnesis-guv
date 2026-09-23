@@ -93,9 +93,11 @@ describe("answerReply", () => {
       (reason) => outcomeOf(answerReply({ status: "denied", taskId: "t", reason })).summary,
     );
     expect(new Set(summaries).size).toBe(reasons.length);
-    expect(outcomeOf(answerReply({ status: "denied", taskId: "t", reason: "newer_reason" })).summary).toBe(
-      "Omnesis did not release an answer to this question.",
-    );
+    for (const reason of ["newer_reason", "constructor", "toString"]) {
+      expect(outcomeOf(answerReply({ status: "denied", taskId: "t", reason })).summary).toBe(
+        "Omnesis did not release an answer to this question.",
+      );
+    }
   });
 
   test("a held answer says where to read it", () => {
@@ -147,7 +149,7 @@ describe("errorReply", () => {
     expect(summary(new GatewayCertificateError("ERR_TLS_CERT_ALTNAME_INVALID"))).toContain(
       "an address the gateway's certificate names",
     );
-    expect(summary(new GatewayRedirectError("https://other.example.org/"))).toContain("--gateway-url");
+    expect(summary(new GatewayRedirectError("https://other.example.org"))).toContain("--gateway-url");
     expect(summary(new InvalidAnswerResponseError())).toContain("--gateway-url points at the Omnesis gateway");
     expect(summary(new AnswerHttpError(401, "UNAUTHORIZED", "Unauthorized"))).toContain("/secure/guv.token");
     expect(summary(new AnswerHttpError(403, "ANSWER_ACCESS_CHANGED", "access changed"))).toBe(

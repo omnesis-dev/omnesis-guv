@@ -6,6 +6,13 @@
 # The SDK must match the daemon, so it is found next to the `guv` on PATH;
 # re-run this after upgrading Guv. GUV_SDK_DIR names another SDK directory.
 set -eu
+# Resolve a caller-supplied SDK directory against the caller's directory, before moving.
+if [ -n "${GUV_SDK_DIR:-}" ]; then
+  GUV_SDK_DIR=$(cd "$GUV_SDK_DIR" 2>/dev/null && pwd -P) || {
+    echo "GUV_SDK_DIR is not a directory." >&2
+    exit 1
+  }
+fi
 cd "$(dirname "$0")/.."
 trap 'rm -rf .guv-sdk.tmp' EXIT
 
