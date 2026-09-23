@@ -8,6 +8,5 @@
     "/home/you/.config/omnesis/guv.token"
   ],
   "cwd": ".",
-  "timeout_ms": 300000,
-  "max_concurrency": 2
+  "timeout_ms": 300000
 }

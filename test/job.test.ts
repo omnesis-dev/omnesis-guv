@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 import { describe, expect, test } from "bun:test";
-import type { HandlerInput, HandlerResult } from "@familiar/guv-handler-sdk";
+import { HANDLER_INPUT_SCHEMA, type HandlerInput, type HandlerResult } from "@familiar/guv-handler-sdk";
 import { AnswerHttpError, MAX_QUESTION_LENGTH, type AnswerRequest } from "../src/answer-client.js";
 import { ConfigError, TokenFileError, type HandlerConfig } from "../src/config.js";
 import { answerJob, type JobDeps } from "../src/job.js";
@@ -13,7 +13,7 @@ const CONFIG: HandlerConfig = {
 };
 
 function input(text: string): HandlerInput {
-  return { schema: "com.familiar.handler.input.v1", job_id: "job-42", run_id: "run-1", input: { text } };
+  return { schema: HANDLER_INPUT_SCHEMA, job_id: "job-42", run_id: "run-1", input: { text } };
 }
 
 function summaryOf(result: HandlerResult): string {

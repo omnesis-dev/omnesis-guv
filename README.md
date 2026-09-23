@@ -16,7 +16,8 @@ access level, a gateway that is down, an answer the privacy policy withheld.
 
 ## Requirements
 
-- Guv, with its own pairing healthy: `guv status` shows `api ok` and `auth ok`.
+- Guv 0.3.19 or later, with its own pairing healthy: `guv status` shows `api ok`
+  and `auth ok`.
 - [Bun](https://bun.sh).
 - An Omnesis gateway that supports integrations, reachable from the Guv machine.
 
@@ -103,9 +104,9 @@ guv status   # handler ok
 
 Guv resolves the file's relative `cwd` against the file itself, so the handler
 runs from this checkout; `bun` must be on the `PATH` Guv loads it with. The
-example gives each Job 300 seconds (`timeout_ms`) and runs two at once
-(`max_concurrency`), which is as many answers as the gateway makes at once for
-one integration.
+example gives each Job 300 seconds (`timeout_ms`). The handler tells Guv to run
+two Jobs at once, as many answers as the gateway makes at once for one
+integration; set `max_concurrency` in the configuration to override it.
 
 A wrong command does not stop the handler: every Job replies with what is
 wrong until you fix the configuration and load it again.
