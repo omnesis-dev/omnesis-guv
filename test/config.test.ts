@@ -3,7 +3,15 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ConfigError, DEFAULT_ANSWER_TIMEOUT_MS, loadConfig, readToken, TokenFileError } from "../src/config.js";
+import {
+  ConfigError,
+  DEFAULT_ANSWER_TIMEOUT_MS,
+  JobFileError,
+  loadConfig,
+  readCa,
+  readJobFiles,
+  readToken,
+} from "../src/config.js";
 
 const dir = mkdtempSync(join(tmpdir(), "omnesis-guv-config-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -31,7 +39,7 @@ describe("loadConfig", () => {
     expect(loadConfig(args())).toEqual({
       gatewayUrl: GATEWAY,
       tokenFile: TOKEN_FILE,
-      ca: undefined,
+      caFile: undefined,
       answerTimeoutMs: DEFAULT_ANSWER_TIMEOUT_MS,
     });
   });
@@ -44,7 +52,9 @@ describe("loadConfig", () => {
   });
 
   test("requires the gateway address and the token file", () => {
-    expect(configError(args({ "gateway-url": undefined }))).toBe("--gateway-url is missing from the handler's command.");
+    expect(configError(args({ "gateway-url": undefined }))).toBe(
+      "--gateway-url is missing from the handler's command.",
+    );
     expect(configError(args({ "token-file": undefined }))).toBe("--token-file is missing from the handler's command.");
     expect(configError(args({ "token-file": "  " }))).toBe("--token-file is missing from the handler's command.");
   });
@@ -63,10 +73,13 @@ describe("loadConfig", () => {
     }
   });
 
-  test("refuses an address that is not a plain gateway URL", () => {
-    expect(configError(args({ "gateway-url": "gateway.example.org" }))).toContain("is not a URL");
+  test("refuses an address that is not a plain gateway URL, never quoting credentials", () => {
+    expect(configError(args({ "gateway-url": "gateway.example.org" }))).toBe("--gateway-url is not a URL.");
     expect(configError(args({ "gateway-url": `${GATEWAY}/?x=1` }))).toContain("plain gateway address");
-    expect(configError(args({ "gateway-url": "https://user:pw@gateway.example.org" }))).toContain("plain gateway address");
+    const withCredentials = configError(args({ "gateway-url": "https://user:hunter2@gateway.example.org" }));
+    expect(withCredentials).toContain("without credentials");
+    expect(withCredentials).not.toContain("hunter2");
+    expect(configError(args({ "gateway-url": "http://user:hunter2@gateway.example.org" }))).not.toContain("hunter2");
   });
 
   test("needs absolute paths, since nothing expands ~ in Guv's command", () => {
@@ -74,14 +87,8 @@ describe("loadConfig", () => {
     expect(configError(args({ "ca-file": "ca.pem" }))).toContain("must be an absolute path");
   });
 
-  test("reads a CA bundle, and refuses one that holds no certificate", () => {
-    const caFile = join(dir, "ca.pem");
-    writeFileSync(caFile, "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n");
-    expect(loadConfig(args({ "ca-file": caFile })).ca).toContain("BEGIN CERTIFICATE");
-    const empty = join(dir, "empty.pem");
-    writeFileSync(empty, "");
-    expect(configError(args({ "ca-file": empty }))).toContain("holds no PEM certificate");
-    expect(configError(args({ "ca-file": join(dir, "missing.pem") }))).toContain("no such file");
+  test("takes the CA bundle's path, which is read per Job", () => {
+    expect(loadConfig(args({ "ca-file": "/etc/omnesis/ca.pem" })).caFile).toBe("/etc/omnesis/ca.pem");
   });
 
   test("validates the time budget", () => {
@@ -102,7 +109,7 @@ describe("readToken", () => {
 
   test("an empty, missing or unreadable file is a token-file error", () => {
     writeFileSync(TOKEN_FILE, "\n");
-    expect(() => readToken(TOKEN_FILE)).toThrow(TokenFileError);
+    expect(() => readToken(TOKEN_FILE)).toThrow(JobFileError);
     expect(() => readToken(TOKEN_FILE)).toThrow("is empty");
     expect(() => readToken(join(dir, "missing.token"))).toThrow("no such file");
     if (process.getuid?.() !== 0) {
@@ -122,11 +129,48 @@ describe("readToken", () => {
         } catch (e) {
           return e as Error;
         }
-        throw new Error("expected a TokenFileError");
+        throw new Error("expected a JobFileError");
       })();
-      expect(error).toBeInstanceOf(TokenFileError);
+      expect(error).toBeInstanceOf(JobFileError);
       expect(error.message).toContain("does not hold a single token");
       expect(error.message).not.toContain("omn_secret");
     }
+  });
+});
+
+describe("readCa", () => {
+  // A throwaway self-signed certificate for a fictional name; only its shape matters.
+  const VALID_CA = `-----BEGIN CERTIFICATE-----
+MIIBkTCCATegAwIBAgIUTO7Uuz8hmxtuUvXlQNH7UpvcgwowCgYIKoZIzj0EAwIw
+HjEcMBoGA1UEAwwTdGVzdC1jYS5leGFtcGxlLm9yZzAeFw0yNjA5MjMxNzQwNTla
+Fw0zNjA5MjAxNzQwNTlaMB4xHDAaBgNVBAMME3Rlc3QtY2EuZXhhbXBsZS5vcmcw
+WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARNeMHqRwFspw1WxjZ3UAX330fCa3sI
+IDS3r8jkhBh3/JopMJ7nCaDZVF6zXRRLIDCVVm9/xGchfq+7bLeMs4Cso1MwUTAd
+BgNVHQ4EFgQUaryC2uLuXAkUiY2VCS7JG3vf15EwHwYDVR0jBBgwFoAUaryC2uLu
+XAkUiY2VCS7JG3vf15EwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBF
+AiEAq938M9fiwGntCjif1nPoJF3Ry5qQe4v48grkwMyfgjMCIE74DW86N++EZInD
+1+ra1YqtP0UWTw3AtfdC1wL7ODog
+-----END CERTIFICATE-----`;
+  // The same certificate with part of its body overwritten.
+  const GARBLED_CA = VALID_CA.replace(/\n[A-Za-z0-9+/]{64}\n/, `\n${"A".repeat(64)}\n`);
+
+  test("refuses a file without a certificate, or with one that does not parse", () => {
+    const empty = join(dir, "empty.pem");
+    writeFileSync(empty, "");
+    expect(() => readCa(empty)).toThrow("holds no PEM certificate");
+    const garbled = join(dir, "garbled.pem");
+    writeFileSync(garbled, GARBLED_CA);
+    expect(GARBLED_CA).not.toBe(VALID_CA);
+    expect(() => readCa(garbled)).toThrow("cannot be parsed");
+    expect(() => readCa(join(dir, "missing.pem"))).toThrow(JobFileError);
+  });
+
+  test("reads a real certificate, and each Job reads both files afresh", () => {
+    const caFile = join(dir, "valid.pem");
+    writeFileSync(caFile, VALID_CA);
+    writeFileSync(TOKEN_FILE, "omn_first\n");
+    expect(readJobFiles({ tokenFile: TOKEN_FILE, caFile })).toEqual({ token: "omn_first", ca: VALID_CA });
+    writeFileSync(TOKEN_FILE, "omn_rotated\n");
+    expect(readJobFiles({ tokenFile: TOKEN_FILE, caFile: undefined })).toEqual({ token: "omn_rotated", ca: undefined });
   });
 });

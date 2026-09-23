@@ -7,15 +7,17 @@
   "type": "module",
   "scripts": {
     "sync-sdk": "scripts/sync-guv-sdk.sh",
-    "handler": "bun src/handler.ts",
     "test": "bun test",
-    "typecheck": "tsc"
+    "typecheck": "tsc",
+    "format": "prettier --write .",
+    "check": "tsc && prettier --check . && bun test"
   },
   "dependencies": {
     "zod": "3.25.76"
   },
   "devDependencies": {
     "@types/bun": "1.4.2",
+    "prettier": "3.9.9",
     "typescript": "7.0.2"
   }
 }

@@ -24,7 +24,10 @@ function client(fetchImpl: Fetch, ca?: string): AnswerClient {
 
 const REQUEST = { question: "q", clientRequestId: "guv_job-1" };
 const signal = () => new AbortController().signal;
-const failure = (fetchImpl: Fetch, abort = signal()) => client(fetchImpl).submit(REQUEST, abort).catch((e: unknown) => e);
+const failure = (fetchImpl: Fetch, abort = signal()) =>
+  client(fetchImpl)
+    .submit(REQUEST, abort)
+    .catch((e: unknown) => e);
 
 describe("AnswerClient.submit", () => {
   test("posts the question under the request id, never asking for approval or following redirects", async () => {
@@ -33,7 +36,8 @@ describe("AnswerClient.submit", () => {
       calls.push({ url, init });
       return new Response(JSON.stringify({ ...IDS, status: "released", releaseId: "r", answer: "Hi" }));
     };
-    const result = await client(fetchImpl).submit({ question: "Hello?", clientRequestId: "guv_job-1" }, signal());
+    const abort = signal();
+    const result = await client(fetchImpl).submit({ question: "Hello?", clientRequestId: "guv_job-1" }, abort);
 
     expect(result).toEqual({ status: "released", taskId: "task_1", answer: "Hi" });
     expect(calls).toHaveLength(1);
@@ -41,8 +45,14 @@ describe("AnswerClient.submit", () => {
     expect(url).toBe(`${GATEWAY}/answer`);
     expect(init.method).toBe("POST");
     expect(init.redirect).toBe("manual");
+    // The Job's time budget reaches the request itself.
+    expect(init.signal).toBe(abort);
     expect((init.headers as Record<string, string>).Authorization).toBe("Bearer omn_secret");
-    expect(JSON.parse(init.body as string)).toEqual({ question: "Hello?", clientRequestId: "guv_job-1", approval: "never" });
+    expect(JSON.parse(init.body as string)).toEqual({
+      question: "Hello?",
+      clientRequestId: "guv_job-1",
+      approval: "never",
+    });
     expect(init.tls).toBeUndefined();
   });
 
@@ -61,7 +71,11 @@ describe("AnswerClient.submit", () => {
       respond({ error: "This integration has no access level yet.", code: "ACCESS_LEVEL_REQUIRED" }, { status: 403 }),
     );
     expect(error).toBeInstanceOf(AnswerHttpError);
-    expect(error).toMatchObject({ status: 403, code: "ACCESS_LEVEL_REQUIRED", detail: "This integration has no access level yet." });
+    expect(error).toMatchObject({
+      status: 403,
+      code: "ACCESS_LEVEL_REQUIRED",
+      detail: "This integration has no access level yet.",
+    });
   });
 
   test("an error without a JSON body still reports its status", async () => {
@@ -70,9 +84,13 @@ describe("AnswerClient.submit", () => {
   });
 
   test("a redirect is refused, not followed", async () => {
-    const error = await failure(respond("", { status: 308, headers: { location: "http://elsewhere.example.org/answer" } }));
+    const error = await failure(
+      respond("", { status: 308, headers: { location: "http://elsewhere.example.org/answer" } }),
+    );
     expect(error).toBeInstanceOf(GatewayRedirectError);
-    expect((error as Error).message).toBe("The Omnesis gateway address redirects to http://elsewhere.example.org/answer.");
+    expect((error as Error).message).toBe(
+      "The Omnesis gateway address redirects to http://elsewhere.example.org/answer.",
+    );
   });
 
   test("a network failure is unreachable, naming the address and the code but never the request", async () => {
@@ -116,7 +134,9 @@ describe("AnswerClient.submit", () => {
   });
 
   test("a success response that is not JSON is never forwarded", async () => {
-    expect(await failure(respond("<html>a login page</html>", { status: 200 }))).toBeInstanceOf(InvalidAnswerResponseError);
+    expect(await failure(respond("<html>a login page</html>", { status: 200 }))).toBeInstanceOf(
+      InvalidAnswerResponseError,
+    );
   });
 });
 
@@ -128,9 +148,17 @@ describe("parseAnswerResponse", () => {
       answer: "A",
     });
     expect(
-      parseAnswerResponse({ ...IDS, status: "released_with_reductions", releaseId: "r", answer: "A", reductions: ["Names"] }),
+      parseAnswerResponse({
+        ...IDS,
+        status: "released_with_reductions",
+        releaseId: "r",
+        answer: "A",
+        reductions: ["Names"],
+      }),
     ).toEqual({ status: "released_with_reductions", taskId: "task_1", answer: "A", reductions: ["Names"] });
-    expect(parseAnswerResponse({ ...IDS, status: "approval_required", approvalId: "ap_1", approvalExpiresAt: 1 })).toEqual({
+    expect(
+      parseAnswerResponse({ ...IDS, status: "approval_required", approvalId: "ap_1", approvalExpiresAt: 1 }),
+    ).toEqual({
       status: "approval_required",
       taskId: "task_1",
       approvalId: "ap_1",
@@ -143,7 +171,9 @@ describe("parseAnswerResponse", () => {
   });
 
   test("keeps a denial reason it does not know, so a newer gateway still reads as a denial", () => {
-    expect(parseAnswerResponse({ ...IDS, status: "denied", reason: "new_reason" })).toMatchObject({ reason: "new_reason" });
+    expect(parseAnswerResponse({ ...IDS, status: "denied", reason: "new_reason" })).toMatchObject({
+      reason: "new_reason",
+    });
   });
 
   test("never forwards a payload that is not a documented verdict", () => {

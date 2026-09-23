@@ -1,16 +1,24 @@
 // SPDX-License-Identifier: MIT
 import { describe, expect, test } from "bun:test";
-import { AnswerHttpError, GatewayUnreachableError, type AnswerRequest, type AnswerResponse } from "../src/answer-client.js";
+import {
+  AnswerHttpError,
+  GatewayUnreachableError,
+  type AnswerRequest,
+  type AnswerResponse,
+} from "../src/answer-client.js";
 import { AnswerDeadlineError, ask, requestIdFor, UNREACHABLE_GIVE_UP_MS, type AskDeps } from "../src/ask.js";
 
 const RELEASED: AnswerResponse = { status: "released", taskId: "task_1", answer: "Yes." };
+
+/** A scripted attempt that never returns: it runs until its deadline signal fires. */
+const HANG = Symbol("hang");
 
 /**
  * A scripted gateway on a virtual clock. Each attempt takes `attemptMs`, then
  * yields the next scripted outcome — unless the attempt's deadline signal
  * fires first, which it does on the same virtual clock.
  */
-function scripted(outcomes: (AnswerResponse | Error)[], attemptMs = 0) {
+function scripted(outcomes: (AnswerResponse | Error | typeof HANG)[], attemptMs = 0) {
   const start = 1_000_000;
   let clock = start;
   const requests: AnswerRequest[] = [];
@@ -31,14 +39,14 @@ function scripted(outcomes: (AnswerResponse | Error)[], attemptMs = 0) {
       submit: async (request, signal) => {
         requests.push(request);
         const deadline = deadlines.get(signal)!;
-        if (clock + attemptMs >= deadline.at) {
+        if (outcomes[0] === HANG || clock + attemptMs >= deadline.at) {
           clock = deadline.at;
           deadline.controller.abort(new DOMException("The operation timed out.", "TimeoutError"));
           throw signal.reason;
         }
         clock += attemptMs;
         const next = outcomes.shift();
-        if (next === undefined) throw new Error("the script ran out");
+        if (next === undefined || next === HANG) throw new Error("the script ran out");
         if (next instanceof Error) throw next;
         return next;
       },
@@ -104,6 +112,23 @@ describe("ask", () => {
     expect(elapsed()).toBeLessThanOrEqual(UNREACHABLE_GIVE_UP_MS + 2 * 1_000);
   });
 
+  test("waits out a proxy answering for a gateway that is restarting or slow", async () => {
+    const { deps, requests } = scripted([
+      new AnswerHttpError(502, undefined, "Bad Gateway"),
+      new AnswerHttpError(504, undefined, "Gateway Timeout"),
+      inProgress(),
+      RELEASED,
+    ]);
+    expect(await ask("q", "job-7", 60_000, deps)).toEqual(RELEASED);
+    expect(requests).toHaveLength(4);
+  });
+
+  test("an attempt that hangs after the gateway went unreachable is reported as the gateway", async () => {
+    const { deps } = scripted([unreachable(), HANG]);
+    const error = await ask("q", "job-7", 20_000, deps).catch((e: unknown) => e);
+    expect(error).toMatchObject({ name: "AnswerDeadlineError", waitingOn: "gateway" });
+  });
+
   test("an outage clock restarts once the gateway answers again", async () => {
     const { deps } = scripted(
       [unreachable(), unreachable(), unreachable(), inProgress(), unreachable(), unreachable(), RELEASED],
@@ -128,7 +153,7 @@ describe("ask", () => {
       new AnswerHttpError(401, "UNAUTHORIZED", "Unauthorized"),
       new AnswerHttpError(403, "ACCESS_LEVEL_REQUIRED", "no level"),
       new AnswerHttpError(429, "ANSWER_EGRESS_LIMIT", "limit"),
-      new AnswerHttpError(502, undefined, "model failed"),
+      new AnswerHttpError(502, "BAD_GATEWAY", "model failed"),
       new AnswerHttpError(503, "SERVICE_UNAVAILABLE", "not serving"),
     ]) {
       const { deps, requests } = scripted([refusal]);
@@ -146,7 +171,9 @@ describe("ask", () => {
     expect(busy.elapsed()).toBe(30_000);
 
     const running = scripted(Array.from({ length: 50 }, inProgress), 5_000);
-    expect(await ask("q", "job-7", 30_000, running.deps).catch((e: unknown) => e)).toMatchObject({ waitingOn: "answer" });
+    expect(await ask("q", "job-7", 30_000, running.deps).catch((e: unknown) => e)).toMatchObject({
+      waitingOn: "answer",
+    });
   });
 
   test("an attempt still running at the deadline is abandoned there", async () => {

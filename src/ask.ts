@@ -17,8 +17,16 @@ const MAX_RETRY_DELAY_MS = 10_000;
  */
 export const UNREACHABLE_GIVE_UP_MS = 30_000;
 
+/** Proxy statuses that mean the gateway behind it is restarting, down, or slow to answer. */
+const PROXY_GAP_STATUSES: ReadonlySet<number> = new Set([502, 503, 504]);
+
 /** Refusals that clear on their own: the task is running, or the gateway is momentarily full. */
-const TRANSIENT_CODES: ReadonlySet<string> = new Set(["ANSWER_IN_PROGRESS", "ANSWER_CAPACITY", "QUEUE_FULL", "SQLITE_READONLY"]);
+const TRANSIENT_CODES: ReadonlySet<string> = new Set([
+  "ANSWER_IN_PROGRESS",
+  "ANSWER_CAPACITY",
+  "QUEUE_FULL",
+  "SQLITE_READONLY",
+]);
 
 /** What the Job was waiting on when its time budget ran out. */
 export type DeadlineWait = "answer" | "capacity" | "gateway";
@@ -64,7 +72,7 @@ export async function ask(question: string, jobId: string, budgetMs: number, dep
     try {
       return await deps.client.submit(request, signal);
     } catch (error) {
-      if (signal.aborted) throw new AnswerDeadlineError(budgetMs, "answer");
+      if (signal.aborted) throw new AnswerDeadlineError(budgetMs, waitingOn === "gateway" ? "gateway" : "answer");
       if (error instanceof AnswerHttpError && error.code === "ANSWER_ACCESS_CHANGED" && !reaskedAfterAccessChange) {
         // The integration's access level changed while the answer was being
         // made, so the gateway withheld it. The same request id asks again
@@ -73,7 +81,9 @@ export async function ask(question: string, jobId: string, budgetMs: number, dep
         unreachableSince = undefined;
         continue;
       }
-      if (error instanceof GatewayUnreachableError) {
+      if (error instanceof GatewayUnreachableError || isProxyGap(error)) {
+        // A proxy answering for a gateway it cannot reach is an outage like any other;
+        // the task, if it was created, keeps running behind it.
         waitingOn = "gateway";
         unreachableSince ??= deps.now();
         if (deps.now() - unreachableSince >= UNREACHABLE_GIVE_UP_MS) throw error;
@@ -91,4 +101,9 @@ export async function ask(question: string, jobId: string, budgetMs: number, dep
     if (wait > 0) await deps.sleep(wait);
     delay = Math.min(delay * 2, MAX_RETRY_DELAY_MS);
   }
+}
+
+/** An uncoded 502/503/504: the gateway's own errors always carry a code, a proxy's do not. */
+function isProxyGap(error: unknown): boolean {
+  return error instanceof AnswerHttpError && error.code === undefined && PROXY_GAP_STATUSES.has(error.status);
 }

@@ -2,13 +2,13 @@
 import { describe, expect, test } from "bun:test";
 import { HANDLER_INPUT_SCHEMA, type HandlerInput, type HandlerResult } from "@familiar/guv-handler-sdk";
 import { AnswerHttpError, MAX_QUESTION_LENGTH, type AnswerRequest } from "../src/answer-client.js";
-import { ConfigError, TokenFileError, type HandlerConfig } from "../src/config.js";
+import { ConfigError, JobFileError, type HandlerConfig } from "../src/config.js";
 import { answerJob, type JobDeps } from "../src/job.js";
 
 const CONFIG: HandlerConfig = {
   gatewayUrl: "https://gateway.example.org:7600",
   tokenFile: "/secure/guv.token",
-  ca: undefined,
+  caFile: undefined,
   answerTimeoutMs: 60_000,
 };
 
@@ -26,9 +26,9 @@ function deps(overrides: Partial<JobDeps> = {}) {
   let clock = 0;
   const value: JobDeps = {
     config: CONFIG,
-    readToken: () => "omn_live",
-    makeClient: (_config, token) => {
-      seen.token = token;
+    readFiles: () => ({ token: "omn_live", ca: undefined }),
+    makeClient: (_config, files) => {
+      seen.token = files.token;
       return {
         submit: async (request) => {
           seen.requests.push(request);
@@ -63,10 +63,10 @@ describe("answerJob", () => {
     expect(seen.requests).toEqual([]);
   });
 
-  test("reports a token file it cannot use, without asking", async () => {
+  test("reports a token or CA file it cannot use, without asking", async () => {
     const { value, seen } = deps({
-      readToken: () => {
-        throw new TokenFileError("The Omnesis token file /secure/guv.token is empty.");
+      readFiles: () => {
+        throw new JobFileError("The Omnesis token file /secure/guv.token is empty.");
       },
     });
     expect(summaryOf(await answerJob(input("Weather?"), value))).toContain("/secure/guv.token is empty");

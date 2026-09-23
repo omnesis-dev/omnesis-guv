@@ -84,15 +84,22 @@ your gateway address and token file:
 cp handler.config.example.json handler.config.json
 ```
 
-| Flag                  | Meaning                                                                                                                                  |
-| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Flag                  | Meaning                                                                                                                                                |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `--gateway-url`       | Required. The gateway address, for example `https://gateway.example.org:7600`. Plain `http` only for this machine (`localhost`, `127.0.0.1`, `[::1]`). |
-| `--token-file`        | Required. Absolute path of the token file. It is read for every Job, so replacing it rotates the token without restarting Guv.          |
-| `--ca-file`           | Absolute path of a PEM bundle to trust, for a gateway whose certificate is not publicly trusted.                                         |
-| `--answer-timeout-ms` | How long one Job may take, retries included. Default `240000`. Keep it under `timeout_ms`, or Guv restarts the handler mid-answer.       |
+| `--token-file`        | Required. Absolute path of the token file. It is read for every Job, so replacing it rotates the token without restarting Guv.                         |
+| `--ca-file`           | Absolute path of a PEM bundle to trust instead of the system's, for a gateway whose certificate is not publicly trusted. Read for every Job.           |
+| `--answer-timeout-ms` | How long one Job may take, retries included. Default `240000`. Keep it under `timeout_ms`, or Guv restarts the handler mid-answer.                     |
 
 Paths must be absolute: Guv runs the command without a shell, so `~` is not
 expanded. `handler.config.json` is ignored by git.
+
+A gateway with its own self-signed certificate keeps it at
+`~/.config/omnesis/tls/cert.pem` on the gateway machine; copy that file to the
+Guv machine and pass it as `--ca-file`. The bundle replaces the system's
+trusted roots for these requests, so leave `--ca-file` out for a gateway with a
+publicly trusted certificate. Because the file is read for every Job, copying
+the renewed certificate over it is enough when the gateway renews.
 
 Then load it and restart the daemon:
 
@@ -101,6 +108,9 @@ guv handler load handler.config.json
 # restart Guv (systemctl --user restart guv.service, brew services restart guv, or guv run), then:
 guv status   # handler ok
 ```
+
+`guv status` only shows that the handler process is up. Send a question from
+the Guv app to see an answer, or the reason there is none.
 
 Guv resolves the file's relative `cwd` against the file itself, so the handler
 runs from this checkout; `bun` must be on the `PATH` Guv loads it with. The
@@ -113,12 +123,13 @@ wrong until you fix the configuration and load it again.
 
 ## How a Job is answered
 
-The handler asks one question per Job and uses the Job id as the gateway
-request id. The gateway keeps each request id as one task and never delivers
+The handler asks one question per Job, under a gateway request id derived from
+the Job id. The gateway keeps each request id as one task and never delivers
 two answers for it, so the handler asks again under the same id when the
-connection drops, while the answer is still being made, and while the gateway
-is momentarily full. A gateway that stays unreachable for 30 seconds is
-reported rather than waited on for the whole time budget. If the
+connection drops, while the answer is still being made, while the gateway is
+momentarily full, and while a proxy in front of it reports it unavailable. A
+gateway that stays unreachable for 30 seconds is reported rather than waited
+on for the whole time budget. If the
 integration's access level changes while an answer is being made, the gateway
 withholds that answer and the handler asks once more under the new level.
 
@@ -131,8 +142,8 @@ after the answer.
 
 ```sh
 bun run sync-sdk    # once, and after upgrading Guv
-bun test
-bun run typecheck
+bun run check       # types, formatting, tests
+bun run format      # rewrite files to the project's formatting
 ```
 
 The tests stub the gateway; they never reach a real one.

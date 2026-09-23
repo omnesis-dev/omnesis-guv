@@ -1,0 +1,3 @@
+.guv-sdk/
+node_modules/
+bun.lock

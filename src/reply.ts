@@ -13,7 +13,7 @@ import {
   type AnswerResponse,
 } from "./answer-client.js";
 import { AnswerDeadlineError, type DeadlineWait } from "./ask.js";
-import { TokenFileError, type ConfigError, type HandlerConfig } from "./config.js";
+import { JobFileError, type ConfigError, type HandlerConfig } from "./config.js";
 
 /** Longest answer shown whole as the compact summary; a longer one is also sent in full as the detail. */
 export const SUMMARY_MAX_LENGTH = 600;
@@ -62,18 +62,24 @@ export function configErrorReply(error: ConfigError): HandlerResult {
 }
 
 export function errorReply(error: unknown, config: Pick<HandlerConfig, "gatewayUrl" | "tokenFile">): HandlerResult {
-  if (error instanceof TokenFileError) {
+  if (error instanceof JobFileError) {
     return textReply(`${sentence(error.message)} Fix the file; the next question reads it again.`);
   }
   if (error instanceof AnswerDeadlineError) {
     return textReply(`${sentence(error.message)} ${DEADLINE_ADVICE[error.waitingOn]}`);
   }
   if (error instanceof GatewayUnreachableError) {
-    return textReply(`${sentence(error.message)} Check that the gateway is running and reachable from the Guv machine.`);
+    return textReply(
+      `${sentence(error.message)} Check that the gateway is running and reachable from the Guv machine.`,
+    );
   }
   if (error instanceof GatewayCertificateError) {
     return textReply(
-      `${sentence(error.message)} If the gateway uses its own certificate authority, pass its CA bundle with --ca-file.`,
+      `${sentence(error.message)} ${
+        error.code === "ERR_TLS_CERT_ALTNAME_INVALID"
+          ? "Set --gateway-url to an address the gateway's certificate names."
+          : "If the gateway uses its own certificate authority, pass its CA bundle with --ca-file."
+      }`,
     );
   }
   if (error instanceof GatewayRedirectError) {
@@ -100,11 +106,6 @@ function httpErrorText(error: AnswerHttpError, config: Pick<HandlerConfig, "gate
       return "This integration's access level changed again while Omnesis was answering. Ask again.";
     case "ANSWER_EGRESS_LIMIT":
       return `${detail} Ask again to start a new answer.`;
-    case "ANSWER_IN_PROGRESS":
-    case "ANSWER_CAPACITY":
-    case "QUEUE_FULL":
-    case "SQLITE_READONLY":
-      return "Omnesis is still busy with this question. Ask again in a minute.";
   }
   if (error.status === 401) {
     return (
@@ -131,18 +132,33 @@ function answerText(answer: string, reductions: readonly string[]): HandlerResul
   const body = answer.trim() || "Omnesis returned an empty answer.";
   const withheld = reductions.map((reduction) => reduction.trim()).filter(Boolean);
   const note =
-    withheld.length > 0 ? ["Omnesis withheld some details:", ...withheld.map((r) => `- ${sentence(r)}`)].join("\n") : "";
+    withheld.length > 0
+      ? ["Omnesis withheld some details:", ...withheld.map((r) => `- ${sentence(r)}`)].join("\n")
+      : "";
   const full = note ? `${body}\n\n${note}` : body;
   if (full.length <= SUMMARY_MAX_LENGTH) return textReply(full);
   const flag = note ? " (Some details were withheld.)" : "";
   return textReply(`${opening(body, SUMMARY_MAX_LENGTH - flag.length)}${flag}`, full);
 }
 
-/** The first paragraph, cut at a word boundary to at most `max` characters. */
+/**
+ * The answer's opening: as many whole paragraphs as fit in `max` characters,
+ * or, when even the first does not fit, that paragraph cut at a word boundary
+ * and marked with "…".
+ */
 function opening(text: string, max: number): string {
-  const paragraph = text.split(/\n\s*\n/, 1)[0]!.trim();
-  if (paragraph.length <= max) return paragraph;
-  const cut = cutAt(paragraph, max - 1);
+  const paragraphs = text
+    .split(/\n\s*\n/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
+  let kept = "";
+  for (const paragraph of paragraphs) {
+    const next = kept ? `${kept}\n\n${paragraph}` : paragraph;
+    if (next.length > max) break;
+    kept = next;
+  }
+  if (kept) return kept;
+  const cut = cutAt(paragraphs[0]!, max - 1);
   const wordEnd = cut.lastIndexOf(" ");
   return `${(wordEnd > max / 2 ? cut.slice(0, wordEnd) : cut).trimEnd()}…`;
 }
@@ -158,7 +174,10 @@ export function textReply(summary: string, detail?: string): HandlerResult {
   if (encodedSize(result) <= HANDLER_RESULT_MAX_BYTES) return result;
   return detail === undefined
     ? outcome(fit((text) => outcome(text), summary))
-    : outcome(summary, fit((text) => outcome(summary, text), detail));
+    : outcome(
+        summary,
+        fit((text) => outcome(summary, text), detail),
+      );
 }
 
 function outcome(summary: string, detail?: string): HandlerResult {

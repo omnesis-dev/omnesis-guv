@@ -9,7 +9,7 @@ import {
   InvalidAnswerResponseError,
 } from "../src/answer-client.js";
 import { AnswerDeadlineError } from "../src/ask.js";
-import { ConfigError, TokenFileError } from "../src/config.js";
+import { ConfigError, JobFileError } from "../src/config.js";
 import { answerReply, configErrorReply, errorReply, SUMMARY_MAX_LENGTH, textReply } from "../src/reply.js";
 
 const MARKER = "[Shortened to fit Guv's result size limit.]";
@@ -28,13 +28,18 @@ const released = (answer: string) => answerReply({ status: "released", taskId: "
 
 describe("answerReply", () => {
   test("a short answer is the whole summary", () => {
-    expect(outcomeOf(released("  Yes, at 3pm.  "))).toEqual({ kind: "text", summary: "Yes, at 3pm.", artifacts: [], effects: [] });
+    expect(outcomeOf(released("  Yes, at 3pm.  "))).toEqual({
+      kind: "text",
+      summary: "Yes, at 3pm.",
+      artifacts: [],
+      effects: [],
+    });
   });
 
-  test("a long answer opens with its first paragraph and carries the whole answer as detail", () => {
-    const answer = `First, the short version.\n\n${"More context. ".repeat(80)}`;
+  test("a long answer opens with the whole paragraphs that fit and carries the whole answer as detail", () => {
+    const answer = `Here are your meetings:\n\nStand-up at 9.\n\n${"More context. ".repeat(80)}`;
     const outcome = outcomeOf(released(answer));
-    expect(outcome.summary).toBe("First, the short version.");
+    expect(outcome.summary).toBe("Here are your meetings:\n\nStand-up at 9.");
     expect(outcome.detail).toBe(answer.trim());
   });
 
@@ -70,7 +75,12 @@ describe("answerReply", () => {
 
   test("a split summary still flags withheld details", () => {
     const outcome = outcomeOf(
-      answerReply({ status: "released_with_reductions", taskId: "t", answer: "word ".repeat(400), reductions: ["Names"] }),
+      answerReply({
+        status: "released_with_reductions",
+        taskId: "t",
+        answer: "word ".repeat(400),
+        reductions: ["Names"],
+      }),
     );
     expect(outcome.summary.endsWith("(Some details were withheld.)")).toBe(true);
     expect(outcome.summary.length).toBeLessThanOrEqual(SUMMARY_MAX_LENGTH);
@@ -79,7 +89,9 @@ describe("answerReply", () => {
 
   test("every denial reason reads as its own sentence, and an unknown one as a plain denial", () => {
     const reasons = ["privacy_policy", "hard_stop", "user_denied", "expired", "canceled", "approval_not_available"];
-    const summaries = reasons.map((reason) => outcomeOf(answerReply({ status: "denied", taskId: "t", reason })).summary);
+    const summaries = reasons.map(
+      (reason) => outcomeOf(answerReply({ status: "denied", taskId: "t", reason })).summary,
+    );
     expect(new Set(summaries).size).toBe(reasons.length);
     expect(outcomeOf(answerReply({ status: "denied", taskId: "t", reason: "newer_reason" })).summary).toBe(
       "Omnesis did not release an answer to this question.",
@@ -124,7 +136,7 @@ describe("errorReply", () => {
   const summary = (error: unknown) => outcomeOf(errorReply(error, config)).summary;
 
   test("says what went wrong and what to do about it", () => {
-    expect(summary(new TokenFileError("The Omnesis token file /secure/guv.token is empty."))).toBe(
+    expect(summary(new JobFileError("The Omnesis token file /secure/guv.token is empty."))).toBe(
       "The Omnesis token file /secure/guv.token is empty. Fix the file; the next question reads it again.",
     );
     expect(summary(new GatewayUnreachableError(config.gatewayUrl, "ConnectionRefused"))).toBe(
@@ -132,6 +144,9 @@ describe("errorReply", () => {
         "Check that the gateway is running and reachable from the Guv machine.",
     );
     expect(summary(new GatewayCertificateError("DEPTH_ZERO_SELF_SIGNED_CERT"))).toContain("--ca-file");
+    expect(summary(new GatewayCertificateError("ERR_TLS_CERT_ALTNAME_INVALID"))).toContain(
+      "an address the gateway's certificate names",
+    );
     expect(summary(new GatewayRedirectError("https://other.example.org/"))).toContain("--gateway-url");
     expect(summary(new InvalidAnswerResponseError())).toContain("--gateway-url points at the Omnesis gateway");
     expect(summary(new AnswerHttpError(401, "UNAUTHORIZED", "Unauthorized"))).toContain("/secure/guv.token");
@@ -151,7 +166,13 @@ describe("errorReply", () => {
     const required = "This integration has no access level yet. Choose one on the portal's Devices page.";
     expect(summary(new AnswerHttpError(403, "ACCESS_LEVEL_REQUIRED", required))).toBe(required);
     expect(
-      summary(new AnswerHttpError(403, "ACCESS_LEVEL_UNAVAILABLE", "This device's access level can no longer answer questions")),
+      summary(
+        new AnswerHttpError(
+          403,
+          "ACCESS_LEVEL_UNAVAILABLE",
+          "This device's access level can no longer answer questions",
+        ),
+      ),
     ).toBe(
       "This device's access level can no longer answer questions. " +
         "Choose another access level on the integration's card on the portal's Devices page.",
@@ -176,7 +197,9 @@ describe("errorReply", () => {
 
 describe("configErrorReply", () => {
   test("names the problem and how to apply the fix", () => {
-    expect(outcomeOf(configErrorReply(new ConfigError("--gateway-url is missing from the handler's command."))).summary).toBe(
+    expect(
+      outcomeOf(configErrorReply(new ConfigError("--gateway-url is missing from the handler's command."))).summary,
+    ).toBe(
       "The Omnesis handler's command is wrong: --gateway-url is missing from the handler's command. " +
         "Fix it in the handler configuration, load it into Guv again, and restart Guv.",
     );
