@@ -1,24 +1,19 @@
 // SPDX-License-Identifier: MIT
 // One call to the Omnesis gateway's `POST /answer`: send a question, get back
-// the gateway's verdict. The gateway makes each request id a durable task, so
-// posting the same id again attaches to that task instead of asking twice;
-// `ask.ts` relies on that to retry safely.
+// the gateway's verdict. The gateway keeps each request id as one durable task
+// and never delivers two answers for it, which is what lets `ask.ts` post the
+// same request again after a failure.
 
-/** Why the gateway declined to release an answer. Deliberately coarse: findings never cross the boundary. */
-export type DenialReason =
-  | "privacy_policy"
-  | "hard_stop"
-  | "user_denied"
-  | "expired"
-  | "canceled"
-  | "approval_not_available";
+/** The gateway's `/answer` question limit, in UTF-16 code units. */
+export const MAX_QUESTION_LENGTH = 10_000;
 
 /** The gateway's verdict on one question. */
 export type AnswerResponse =
   | { status: "released"; taskId: string; answer: string }
   | { status: "released_with_reductions"; taskId: string; answer: string; reductions: string[] }
   | { status: "approval_required"; taskId: string; approvalId: string }
-  | { status: "denied"; taskId: string; reason: DenialReason };
+  /** `reason` is deliberately coarse — findings never cross the boundary — and may gain values. */
+  | { status: "denied"; taskId: string; reason: string };
 
 export interface AnswerRequest {
   question: string;
@@ -37,16 +32,39 @@ export class AnswerHttpError extends Error {
   }
 }
 
-/** The request never produced an HTTP response. */
+/**
+ * The request, or its response, never made it across the network. The
+ * message names only the failure's code: a raw fetch message can quote the
+ * request, token included.
+ */
 export class GatewayUnreachableError extends Error {
   override readonly name = "GatewayUnreachableError";
+  constructor(gatewayUrl: string, code: string | undefined) {
+    super(`Cannot reach Omnesis at ${gatewayUrl}${code ? ` (${code})` : ""}.`);
+  }
+}
+
+/** The gateway's certificate is not trusted; retrying cannot help. */
+export class GatewayCertificateError extends Error {
+  override readonly name = "GatewayCertificateError";
+  constructor(readonly code: string) {
+    super(`The Omnesis gateway's certificate is not trusted (${code}).`);
+  }
+}
+
+/** The gateway address answers with a redirect, which is never followed with the token. */
+export class GatewayRedirectError extends Error {
+  override readonly name = "GatewayRedirectError";
+  constructor(readonly location: string | null) {
+    super(`The Omnesis gateway address redirects${location ? ` to ${location}` : ""}.`);
+  }
 }
 
 /** A success response that does not have the documented shape is never forwarded. */
 export class InvalidAnswerResponseError extends Error {
   override readonly name = "InvalidAnswerResponseError";
   constructor() {
-    super("Omnesis sent an answer in a shape this handler does not understand.");
+    super("Omnesis answered in a form this handler does not understand.");
   }
 }
 
@@ -61,6 +79,17 @@ export interface AnswerClientOptions {
   fetchImpl?: Fetch;
 }
 
+/** Certificate failures as Bun's `fetch` reports them. */
+const CERTIFICATE_ERRORS: ReadonlySet<string> = new Set([
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+  "CERT_HAS_EXPIRED",
+  "CERT_NOT_YET_VALID",
+  "ERR_TLS_CERT_ALTNAME_INVALID",
+]);
+
 export class AnswerClient {
   private readonly fetchImpl: Fetch;
 
@@ -70,10 +99,13 @@ export class AnswerClient {
 
   async submit(request: AnswerRequest, signal: AbortSignal): Promise<AnswerResponse> {
     let response: Response;
+    let body: string;
     try {
       response = await this.fetchImpl(`${this.options.gatewayUrl}/answer`, {
         method: "POST",
         signal,
+        // `/answer` never redirects; following one would send the token on.
+        redirect: "manual",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${this.options.token}`,
@@ -83,33 +115,32 @@ export class AnswerClient {
         body: JSON.stringify({ ...request, approval: "never" }),
         ...(this.options.ca ? { tls: { ca: this.options.ca } } : {}),
       });
+      // Read inside the transport guard: a connection lost mid-body is a
+      // dropped connection like any other.
+      body = await response.text();
     } catch (error) {
       if (signal.aborted) throw signal.reason;
-      throw new GatewayUnreachableError(
-        `Cannot reach Omnesis at ${this.options.gatewayUrl} (${error instanceof Error ? error.message : String(error)}).`,
-      );
+      const code = errorCode(error);
+      if (code && CERTIFICATE_ERRORS.has(code)) throw new GatewayCertificateError(code);
+      throw new GatewayUnreachableError(this.options.gatewayUrl, code);
     }
-    const payload: unknown = await response.json().catch(() => undefined);
+    if (response.status >= 300 && response.status < 400) {
+      throw new GatewayRedirectError(response.headers.get("location"));
+    }
+    const payload = parseJson(body);
     if (!response.ok) {
       const envelope = isRecord(payload) ? payload : {};
       throw new AnswerHttpError(
         response.status,
         typeof envelope.code === "string" ? envelope.code : undefined,
-        typeof envelope.error === "string" ? envelope.error : response.statusText || "no detail given",
+        typeof envelope.error === "string" && envelope.error.trim()
+          ? envelope.error.trim()
+          : response.statusText || "no detail given",
       );
     }
     return parseAnswerResponse(payload);
   }
 }
-
-const DENIAL_REASONS: ReadonlySet<string> = new Set<DenialReason>([
-  "privacy_policy",
-  "hard_stop",
-  "user_denied",
-  "expired",
-  "canceled",
-  "approval_not_available",
-]);
 
 export function parseAnswerResponse(payload: unknown): AnswerResponse {
   if (!isRecord(payload)) throw new InvalidAnswerResponseError();
@@ -126,10 +157,28 @@ export function parseAnswerResponse(payload: unknown): AnswerResponse {
       if (typeof payload.approvalId !== "string" || !payload.approvalId) break;
       return { status, taskId, approvalId: payload.approvalId };
     case "denied":
-      if (typeof payload.reason !== "string" || !DENIAL_REASONS.has(payload.reason)) break;
-      return { status, taskId, reason: payload.reason as DenialReason };
+      if (typeof payload.reason !== "string") break;
+      return { status, taskId, reason: payload.reason };
   }
   throw new InvalidAnswerResponseError();
+}
+
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+/** A fetch failure's code, from the error or the cause it wraps. */
+function errorCode(error: unknown): string | undefined {
+  for (let current = error, depth = 0; current && depth < 3; depth++) {
+    if (typeof current !== "object") return undefined;
+    if ("code" in current && typeof current.code === "string") return current.code;
+    current = "cause" in current ? current.cause : undefined;
+  }
+  return undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

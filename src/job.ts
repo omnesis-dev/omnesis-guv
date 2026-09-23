@@ -1,34 +1,39 @@
 // SPDX-License-Identifier: MIT
 // One Guv Job, start to finish: check the question, read the token, ask
 // Omnesis, and turn whatever happened into the reply the person sees. It never
-// throws — a thrown Job fails in Guv without an explanation.
+// throws: a thrown Job makes the handler process exit, failing every Job in
+// flight without an explanation.
 
 import type { HandlerInput, HandlerResult } from "@familiar/guv-handler-sdk";
-import { AnswerClient } from "./answer-client.js";
-import { ask, MAX_QUESTION_LENGTH, type AskDeps } from "./ask.js";
-import { readToken, type HandlerConfig } from "./config.js";
-import { answerReply, errorReply, textReply } from "./reply.js";
+import { AnswerClient, MAX_QUESTION_LENGTH } from "./answer-client.js";
+import { ask, type AskDeps } from "./ask.js";
+import { readToken, type ConfigError, type HandlerConfig } from "./config.js";
+import { answerReply, configErrorReply, errorReply, textReply } from "./reply.js";
 
 export interface JobDeps {
   /** The configuration read at startup, or why it could not be. */
-  config: HandlerConfig | Error;
+  config: HandlerConfig | ConfigError;
   readToken: (tokenFile: string) => string;
-  client: (config: HandlerConfig, token: string) => AskDeps["client"];
-  now: AskDeps["now"];
-  sleep: AskDeps["sleep"];
+  makeClient: (config: HandlerConfig, token: string) => AskDeps["client"];
+  clock: Pick<AskDeps, "now" | "sleep" | "timeout">;
 }
 
-export const defaultJobDeps = (config: HandlerConfig | Error): JobDeps => ({
-  config,
-  readToken,
-  client: (resolved, token) => new AnswerClient({ gatewayUrl: resolved.gatewayUrl, token, ca: resolved.ca }),
-  now: Date.now,
-  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-});
+export function productionJobDeps(config: HandlerConfig | ConfigError): JobDeps {
+  return {
+    config,
+    readToken,
+    makeClient: (resolved, token) => new AnswerClient({ gatewayUrl: resolved.gatewayUrl, token, ca: resolved.ca }),
+    clock: {
+      now: Date.now,
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      timeout: (ms) => AbortSignal.timeout(ms),
+    },
+  };
+}
 
 export async function answerJob(input: HandlerInput, deps: JobDeps): Promise<HandlerResult> {
   const { config } = deps;
-  if (config instanceof Error) return errorReply(config);
+  if (config instanceof Error) return configErrorReply(config);
   const question = input.input.text.trim();
   if (!question) return textReply("Guv sent an empty question; there was nothing to ask Omnesis.");
   if (question.length > MAX_QUESTION_LENGTH) {
@@ -38,13 +43,8 @@ export async function answerJob(input: HandlerInput, deps: JobDeps): Promise<Han
     );
   }
   try {
-    const client = deps.client(config, deps.readToken(config.tokenFile));
-    const response = await ask(question, input.job_id, config.answerTimeoutMs, {
-      client,
-      now: deps.now,
-      sleep: deps.sleep,
-    });
-    return answerReply(response);
+    const client = deps.makeClient(config, deps.readToken(config.tokenFile));
+    return answerReply(await ask(question, input.job_id, config.answerTimeoutMs, { client, ...deps.clock }));
   } catch (error) {
     return errorReply(error, config);
   }

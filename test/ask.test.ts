@@ -1,27 +1,41 @@
 // SPDX-License-Identifier: MIT
 import { describe, expect, test } from "bun:test";
 import { AnswerHttpError, GatewayUnreachableError, type AnswerRequest, type AnswerResponse } from "../src/answer-client.js";
-import { AnswerDeadlineError, ask, UNREACHABLE_GIVE_UP_MS, type AskDeps } from "../src/ask.js";
+import { AnswerDeadlineError, ask, requestIdFor, UNREACHABLE_GIVE_UP_MS, type AskDeps } from "../src/ask.js";
 
 const RELEASED: AnswerResponse = { status: "released", taskId: "task_1", answer: "Yes." };
 
 /**
- * A scripted gateway on a virtual clock: each attempt takes `attemptMs` and
- * then yields the next scripted outcome; `sleep` only advances the clock.
+ * A scripted gateway on a virtual clock. Each attempt takes `attemptMs`, then
+ * yields the next scripted outcome — unless the attempt's deadline signal
+ * fires first, which it does on the same virtual clock.
  */
 function scripted(outcomes: (AnswerResponse | Error)[], attemptMs = 0) {
-  let clock = 1_000_000;
+  const start = 1_000_000;
+  let clock = start;
   const requests: AnswerRequest[] = [];
   const sleeps: number[] = [];
+  const deadlines = new Map<AbortSignal, { controller: AbortController; at: number }>();
   const deps: AskDeps = {
     now: () => clock,
     sleep: async (ms) => {
       sleeps.push(ms);
       clock += ms;
     },
+    timeout: (ms) => {
+      const controller = new AbortController();
+      deadlines.set(controller.signal, { controller, at: clock + ms });
+      return controller.signal;
+    },
     client: {
-      submit: async (request) => {
+      submit: async (request, signal) => {
         requests.push(request);
+        const deadline = deadlines.get(signal)!;
+        if (clock + attemptMs >= deadline.at) {
+          clock = deadline.at;
+          deadline.controller.abort(new DOMException("The operation timed out.", "TimeoutError"));
+          throw signal.reason;
+        }
         clock += attemptMs;
         const next = outcomes.shift();
         if (next === undefined) throw new Error("the script ran out");
@@ -30,26 +44,42 @@ function scripted(outcomes: (AnswerResponse | Error)[], attemptMs = 0) {
       },
     },
   };
-  return { deps, requests, sleeps };
+  return { deps, requests, sleeps, elapsed: () => clock - start };
 }
 
 const inProgress = () => new AnswerHttpError(409, "ANSWER_IN_PROGRESS", "still answering");
 const capacity = () => new AnswerHttpError(503, "ANSWER_CAPACITY", "turn limit full");
 const accessChanged = () => new AnswerHttpError(403, "ANSWER_ACCESS_CHANGED", "access changed");
-const unreachable = () => new GatewayUnreachableError("Cannot reach Omnesis.");
+const unreachable = () => new GatewayUnreachableError("https://gateway.example.org:7600", "ConnectionRefused");
+
+describe("requestIdFor", () => {
+  test("keeps Job ids distinct while making every one a valid gateway request id", () => {
+    const gatewayRequestId = /^[A-Za-z0-9_.:-]{1,160}$/;
+    const jobIds = ["job-7", "a~b", "~", `${"x".repeat(127)}~`];
+    for (const jobId of jobIds) expect(requestIdFor(jobId)).toMatch(gatewayRequestId);
+    expect(requestIdFor("a~b")).toBe("guv_a:b");
+    expect(requestIdFor("a~b")).not.toBe(requestIdFor("a-b"));
+  });
+});
 
 describe("ask", () => {
   test("asks once under the Job's request id", async () => {
     const { deps, requests } = scripted([RELEASED]);
-    expect(await ask("Is it raining?", "job-7", 60_000, deps)).toEqual(RELEASED);
-    expect(requests).toEqual([{ question: "Is it raining?", clientRequestId: "guv_job-7" }]);
+    expect(await ask("Is it raining?", "job~7", 60_000, deps)).toEqual(RELEASED);
+    expect(requests).toEqual([{ question: "Is it raining?", clientRequestId: "guv_job:7" }]);
   });
 
-  test("waits out a busy gateway and a running task, with growing pauses, on the same request id", async () => {
-    const { deps, requests, sleeps } = scripted([capacity(), inProgress(), inProgress(), RELEASED]);
+  test("waits out a running task and a full gateway, with growing pauses, on the same request id", async () => {
+    const { deps, requests, sleeps } = scripted([
+      capacity(),
+      inProgress(),
+      new AnswerHttpError(503, "QUEUE_FULL", "try again in a moment"),
+      new AnswerHttpError(503, "SQLITE_READONLY", "try again in a moment"),
+      RELEASED,
+    ]);
     expect(await ask("q", "job-7", 60_000, deps)).toEqual(RELEASED);
     expect(new Set(requests.map((r) => r.clientRequestId))).toEqual(new Set(["guv_job-7"]));
-    expect(sleeps).toEqual([1_000, 2_000, 4_000]);
+    expect(sleeps).toEqual([1_000, 2_000, 4_000, 8_000]);
   });
 
   test("pauses are capped", async () => {
@@ -64,14 +94,14 @@ describe("ask", () => {
     expect(requests).toHaveLength(3);
   });
 
-  test("reports a gateway that stays unreachable without spending the whole budget", async () => {
-    const { deps, requests } = scripted(Array.from({ length: 20 }, unreachable), 1_000);
+  test("reports a gateway that stays unreachable once the outage reaches its limit, not at the deadline", async () => {
+    const outage = Array.from({ length: 20 }, unreachable);
+    const { deps, elapsed } = scripted(outage, 1_000);
     const error = await ask("q", "job-7", 240_000, deps).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(GatewayUnreachableError);
-    // Attempts run until the outage has lasted UNREACHABLE_GIVE_UP_MS, far short of the budget.
-    expect(requests.length).toBeLessThan(10);
-    expect(requests.length).toBeGreaterThan(2);
-    expect(UNREACHABLE_GIVE_UP_MS).toBeLessThan(240_000);
+    // The last attempt starts exactly when the outage reaches its limit.
+    expect(elapsed()).toBeGreaterThanOrEqual(UNREACHABLE_GIVE_UP_MS);
+    expect(elapsed()).toBeLessThanOrEqual(UNREACHABLE_GIVE_UP_MS + 2 * 1_000);
   });
 
   test("an outage clock restarts once the gateway answers again", async () => {
@@ -83,15 +113,14 @@ describe("ask", () => {
   });
 
   test("asks again once when the access level changed mid-answer, then gives up", async () => {
-    const once = scripted([accessChanged(), RELEASED]);
+    const once = scripted([inProgress(), accessChanged(), RELEASED]);
     expect(await ask("q", "job-7", 60_000, once.deps)).toEqual(RELEASED);
-    expect(once.requests).toHaveLength(2);
-    expect(once.requests[1]!.clientRequestId).toBe("guv_job-7");
+    expect(once.requests.map((r) => r.clientRequestId)).toEqual(["guv_job-7", "guv_job-7", "guv_job-7"]);
 
-    const twice = scripted([accessChanged(), accessChanged()]);
+    const twice = scripted([accessChanged(), inProgress(), accessChanged()]);
     const error = await ask("q", "job-7", 60_000, twice.deps).catch((e: unknown) => e);
     expect(error).toMatchObject({ code: "ANSWER_ACCESS_CHANGED" });
-    expect(twice.requests).toHaveLength(2);
+    expect(twice.requests).toHaveLength(3);
   });
 
   test("does not retry a refusal waiting cannot fix", async () => {
@@ -108,25 +137,23 @@ describe("ask", () => {
     }
   });
 
-  test("stops at the deadline while the gateway stays busy", async () => {
-    const { deps, sleeps } = scripted(Array.from({ length: 50 }, inProgress), 5_000);
-    const error = await ask("q", "job-7", 30_000, deps).catch((e: unknown) => e);
+  test("stops exactly at the deadline, saying what it was waiting on", async () => {
+    const busy = scripted(Array.from({ length: 50 }, capacity), 5_000);
+    const error = await ask("q", "job-7", 30_000, busy.deps).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(AnswerDeadlineError);
     expect((error as Error).message).toBe("Omnesis did not answer within 30 seconds.");
-    // No pause runs past the deadline.
-    expect(sleeps.reduce((sum, ms) => sum + ms, 0)).toBeLessThanOrEqual(30_000);
+    expect(error).toMatchObject({ waitingOn: "capacity" });
+    expect(busy.elapsed()).toBe(30_000);
+
+    const running = scripted(Array.from({ length: 50 }, inProgress), 5_000);
+    expect(await ask("q", "job-7", 30_000, running.deps).catch((e: unknown) => e)).toMatchObject({ waitingOn: "answer" });
   });
 
-  test("an attempt still running at the deadline is abandoned as a deadline", async () => {
-    const deps: AskDeps = {
-      now: Date.now,
-      sleep: async () => {},
-      client: {
-        submit: (_request, signal) =>
-          new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason))),
-      },
-    };
-    const error = await ask("q", "job-7", 30, deps).catch((e: unknown) => e);
-    expect(error).toBeInstanceOf(AnswerDeadlineError);
+  test("an attempt still running at the deadline is abandoned there", async () => {
+    const { deps, requests, elapsed } = scripted([RELEASED], 90_000);
+    const error = await ask("q", "job-7", 30_000, deps).catch((e: unknown) => e);
+    expect(error).toMatchObject({ name: "AnswerDeadlineError", waitingOn: "answer" });
+    expect(requests).toHaveLength(1);
+    expect(elapsed()).toBe(30_000);
   });
 });

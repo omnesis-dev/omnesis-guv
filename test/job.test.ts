@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 import { describe, expect, test } from "bun:test";
 import type { HandlerInput, HandlerResult } from "@familiar/guv-handler-sdk";
-import { AnswerHttpError, type AnswerRequest } from "../src/answer-client.js";
-import { ConfigError, type HandlerConfig } from "../src/config.js";
+import { AnswerHttpError, MAX_QUESTION_LENGTH, type AnswerRequest } from "../src/answer-client.js";
+import { ConfigError, TokenFileError, type HandlerConfig } from "../src/config.js";
 import { answerJob, type JobDeps } from "../src/job.js";
 
 const CONFIG: HandlerConfig = {
@@ -23,10 +23,11 @@ function summaryOf(result: HandlerResult): string {
 
 function deps(overrides: Partial<JobDeps> = {}) {
   const seen: { token?: string; requests: AnswerRequest[] } = { requests: [] };
+  let clock = 0;
   const value: JobDeps = {
     config: CONFIG,
     readToken: () => "omn_live",
-    client: (_config, token) => {
+    makeClient: (_config, token) => {
       seen.token = token;
       return {
         submit: async (request) => {
@@ -35,8 +36,14 @@ function deps(overrides: Partial<JobDeps> = {}) {
         },
       };
     },
-    now: () => 0,
-    sleep: async () => {},
+    // An advancing clock, so a scripted retry can never spin forever.
+    clock: {
+      now: () => clock,
+      sleep: async (ms) => {
+        clock += ms;
+      },
+      timeout: () => new AbortController().signal,
+    },
     ...overrides,
   };
   return { value, seen };
@@ -50,37 +57,42 @@ describe("answerJob", () => {
     expect(seen.requests).toEqual([{ question: "Weather today?", clientRequestId: "guv_job-42" }]);
   });
 
-  test("reports a configuration read at startup that failed", async () => {
-    const { value, seen } = deps({ config: new ConfigError("OMNESIS_GATEWAY_URL is not set in the Guv daemon's environment.") });
-    expect(summaryOf(await answerJob(input("Weather?"), value))).toContain("OMNESIS_GATEWAY_URL is not set");
+  test("reports a configuration read at startup that failed, without asking", async () => {
+    const { value, seen } = deps({ config: new ConfigError("--gateway-url is missing from the handler's command.") });
+    expect(summaryOf(await answerJob(input("Weather?"), value))).toContain("--gateway-url is missing");
     expect(seen.requests).toEqual([]);
   });
 
-  test("reports a token file it cannot read, without asking", async () => {
+  test("reports a token file it cannot use, without asking", async () => {
     const { value, seen } = deps({
       readToken: () => {
-        throw new ConfigError("The Omnesis token file /secure/guv.token is empty.");
+        throw new TokenFileError("The Omnesis token file /secure/guv.token is empty.");
       },
     });
     expect(summaryOf(await answerJob(input("Weather?"), value))).toContain("/secure/guv.token is empty");
     expect(seen.requests).toEqual([]);
   });
 
-  test("answers an empty or overlong question itself", async () => {
+  test("answers an empty or overlong question itself, and passes one at the limit", async () => {
     const { value, seen } = deps();
     expect(summaryOf(await answerJob(input(" \n "), value))).toContain("empty question");
-    expect(summaryOf(await answerJob(input("x".repeat(10_001)), value))).toContain("at most 10,000");
+    expect(summaryOf(await answerJob(input("x".repeat(MAX_QUESTION_LENGTH + 1)), value))).toContain(
+      `at most ${MAX_QUESTION_LENGTH.toLocaleString("en")}`,
+    );
     expect(seen.requests).toEqual([]);
+    expect(summaryOf(await answerJob(input("x".repeat(MAX_QUESTION_LENGTH)), value))).toBe("It is sunny.");
   });
 
-  test("turns a gateway refusal into its reply", async () => {
+  test("turns a gateway refusal into its reply, with the configured token file", async () => {
     const { value } = deps({
-      client: () => ({
+      makeClient: () => ({
         submit: async () => {
           throw new AnswerHttpError(401, "UNAUTHORIZED", "Unauthorized");
         },
       }),
     });
-    expect(summaryOf(await answerJob(input("Weather?"), value))).toContain("rejected this handler's token");
+    const summary = summaryOf(await answerJob(input("Weather?"), value));
+    expect(summary).toContain("rejected this handler's token");
+    expect(summary).toContain("/secure/guv.token");
   });
 });

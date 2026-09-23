@@ -1,6 +1,13 @@
 {
-  "command": ["bun", "src/handler.ts"],
+  "command": [
+    "bun",
+    "src/handler.ts",
+    "--gateway-url",
+    "https://gateway.example.org:7600",
+    "--token-file",
+    "/home/you/.config/omnesis/guv.token"
+  ],
   "cwd": ".",
   "timeout_ms": 300000,
-  "max_concurrency": 4
+  "max_concurrency": 2
 }

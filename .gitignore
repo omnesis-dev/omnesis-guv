@@ -1,5 +1,9 @@
 node_modules/
 .guv-sdk/
 .guv-sdk.tmp/
-*.token
+handler.config.json
 .guv-handler.*
+*.token
+*.pem
+.env
+.env.*

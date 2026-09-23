@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: MIT
-// Get one Guv Job's question answered within its time budget. The Job id
-// becomes the gateway request id, so every attempt for a Job is the same
-// durable task on the gateway: re-posting after a dropped connection or a
-// busy gateway collects the answer already being made, never a second one.
+// Get one Guv Job's question answered within its time budget. Every attempt
+// for a Job posts the same request id, so they all address one durable task on
+// the gateway: posting again after a dropped connection, while the task is
+// running, or while the gateway is momentarily full collects that task's
+// answer, and the gateway never delivers two answers for one id.
 
-import { AnswerHttpError, GatewayUnreachableError, type AnswerResponse, type AnswerClient } from "./answer-client.js";
-
-/** The gateway's `/answer` question limit, in UTF-16 code units. */
-export const MAX_QUESTION_LENGTH = 10_000;
+import { AnswerHttpError, GatewayUnreachableError, type AnswerClient, type AnswerResponse } from "./answer-client.js";
 
 const FIRST_RETRY_DELAY_MS = 1_000;
 const MAX_RETRY_DELAY_MS = 10_000;
+
 /**
  * How long the gateway may stay unreachable before the Job reports it. A
  * restart or a network blip is over well within this; a gateway that is down
@@ -18,10 +17,18 @@ const MAX_RETRY_DELAY_MS = 10_000;
  */
 export const UNREACHABLE_GIVE_UP_MS = 30_000;
 
-/** The time budget ran out before the gateway returned a verdict. */
+/** Refusals that clear on their own: the task is running, or the gateway is momentarily full. */
+const TRANSIENT_CODES: ReadonlySet<string> = new Set(["ANSWER_IN_PROGRESS", "ANSWER_CAPACITY", "QUEUE_FULL", "SQLITE_READONLY"]);
+
+/** What the Job was waiting on when its time budget ran out. */
+export type DeadlineWait = "answer" | "capacity" | "gateway";
+
 export class AnswerDeadlineError extends Error {
   override readonly name = "AnswerDeadlineError";
-  constructor(readonly budgetMs: number) {
+  constructor(
+    readonly budgetMs: number,
+    readonly waitingOn: DeadlineWait,
+  ) {
     super(`Omnesis did not answer within ${Math.round(budgetMs / 1000)} seconds.`);
   }
 }
@@ -30,62 +37,58 @@ export interface AskDeps {
   client: Pick<AnswerClient, "submit">;
   now: () => number;
   sleep: (ms: number) => Promise<void>;
+  /** A signal that aborts after `ms`, on the same clock as `now`. */
+  timeout: (ms: number) => AbortSignal;
 }
 
-export async function ask(
-  question: string,
-  jobId: string,
-  budgetMs: number,
-  deps: AskDeps,
-): Promise<AnswerResponse> {
+/**
+ * The gateway request id for a Guv Job. Job ids may contain `~`, which request
+ * ids may not; `:` never occurs in a Job id, so the mapping keeps distinct
+ * Jobs distinct.
+ */
+export function requestIdFor(jobId: string): string {
+  return `guv_${jobId.replaceAll("~", ":")}`;
+}
+
+export async function ask(question: string, jobId: string, budgetMs: number, deps: AskDeps): Promise<AnswerResponse> {
   const deadline = deps.now() + budgetMs;
-  const request = { question, clientRequestId: `guv_${jobId}` };
+  const request = { question, clientRequestId: requestIdFor(jobId) };
   let delay = FIRST_RETRY_DELAY_MS;
   let reaskedAfterAccessChange = false;
   let unreachableSince: number | undefined;
+  let waitingOn: DeadlineWait = "answer";
   for (;;) {
     const remaining = deadline - deps.now();
-    if (remaining <= 0) throw new AnswerDeadlineError(budgetMs);
-    const signal = AbortSignal.timeout(remaining);
+    if (remaining <= 0) throw new AnswerDeadlineError(budgetMs, waitingOn);
+    const signal = deps.timeout(remaining);
     try {
       return await deps.client.submit(request, signal);
     } catch (error) {
-      if (signal.aborted) throw new AnswerDeadlineError(budgetMs);
-      if (error instanceof GatewayUnreachableError) {
-        unreachableSince ??= deps.now();
-        if (deps.now() - unreachableSince >= UNREACHABLE_GIVE_UP_MS) throw error;
-      } else {
-        unreachableSince = undefined;
-      }
-      if (isAccessChange(error) && !reaskedAfterAccessChange) {
+      if (signal.aborted) throw new AnswerDeadlineError(budgetMs, "answer");
+      if (error instanceof AnswerHttpError && error.code === "ANSWER_ACCESS_CHANGED" && !reaskedAfterAccessChange) {
         // The integration's access level changed while the answer was being
         // made, so the gateway withheld it. The same request id asks again
         // under the new level — once: a second change is left to the person.
         reaskedAfterAccessChange = true;
+        unreachableSince = undefined;
         continue;
       }
-      if (!isWorthWaitingOut(error)) throw error;
+      if (error instanceof GatewayUnreachableError) {
+        waitingOn = "gateway";
+        unreachableSince ??= deps.now();
+        if (deps.now() - unreachableSince >= UNREACHABLE_GIVE_UP_MS) throw error;
+      } else if (error instanceof AnswerHttpError && error.code !== undefined && TRANSIENT_CODES.has(error.code)) {
+        waitingOn = error.code === "ANSWER_IN_PROGRESS" ? "answer" : "capacity";
+        unreachableSince = undefined;
+      } else {
+        throw error;
+      }
     }
-    const wait = Math.min(delay, deadline - deps.now());
-    if (wait <= 0) throw new AnswerDeadlineError(budgetMs);
-    await deps.sleep(wait);
+    const now = deps.now();
+    let wait = Math.min(delay, deadline - now);
+    // Try once more exactly when the outage reaches its limit, not a full pause later.
+    if (unreachableSince !== undefined) wait = Math.min(wait, unreachableSince + UNREACHABLE_GIVE_UP_MS - now);
+    if (wait > 0) await deps.sleep(wait);
     delay = Math.min(delay * 2, MAX_RETRY_DELAY_MS);
   }
-}
-
-function isAccessChange(error: unknown): boolean {
-  return error instanceof AnswerHttpError && error.code === "ANSWER_ACCESS_CHANGED";
-}
-
-/**
- * Failures that end on their own: the connection dropped (the task keeps
- * running on the gateway), the task is still being answered, or the gateway's
- * turn limit is momentarily full.
- */
-function isWorthWaitingOut(error: unknown): boolean {
-  if (error instanceof GatewayUnreachableError) return true;
-  return (
-    error instanceof AnswerHttpError &&
-    (error.code === "ANSWER_IN_PROGRESS" || error.code === "ANSWER_CAPACITY")
-  );
 }

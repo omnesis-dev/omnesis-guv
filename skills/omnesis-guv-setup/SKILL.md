@@ -15,7 +15,7 @@ their phone.
 
 - Change Guv's configuration only through the `guv` CLI. Never read or edit
   Guv's credential file.
-- Never print a token or a pairing code in full. Redeem with `--save <path>`
+- Never print a token or put it on a command line. Redeem with `--save <path>`
   so the token goes straight into a mode-0600 file.
 - The access level is the user's decision: it sets which sources answers may
   draw on and whether a privacy policy reviews them. Ask which level to use (or
@@ -30,7 +30,7 @@ their phone.
    receives Jobs until the user reruns `guv setup`.
 2. `bun --version` works.
 3. The gateway answers from the Guv machine:
-   `curl -fsS https://<gateway>:7600/health`. Use `--cacert <ca.pem>` if its
+   `curl -fsS https://<gateway>:7600/health`. Add `--cacert <ca.pem>` if its
    certificate is not publicly trusted; never `-k` against a remote host.
 
 ### 2. Install the handler
@@ -42,9 +42,8 @@ bun run sync-sdk
 bun test
 ```
 
-`bun run sync-sdk` copies the SDK shipped with the installed Guv into
-`.guv-sdk/`; it fails with an explanation if Guv or a matching `zod` is
-missing.
+`bun run sync-sdk` copies the SDK that ships with the `guv` on `PATH` into
+`.guv-sdk/`, and explains what is missing when it cannot.
 
 ### 3. Pair the integration
 
@@ -68,48 +67,51 @@ Redeem on the Guv machine:
 omnesis devices redeem <code> --gateway-url https://<gateway>:7600 --save ~/.config/omnesis/guv.token
 ```
 
-Without the Omnesis CLI, `POST /devices/pair` with
-`{"pairingCode":"<code>","kind":"integration"}` and write the response's
-`token` field to the same path with mode 0600.
-
-### 4. Configure the daemon's environment
-
-Set, wherever the Guv daemon's environment comes from (for a systemd user
-service, a drop-in from `systemctl --user edit guv.service`):
-
-- `OMNESIS_GATEWAY_URL` — the gateway address.
-- `OMNESIS_TOKEN_FILE` — the absolute path of the token file.
-- `OMNESIS_CA_FILE` — only for a gateway whose certificate is not publicly
-  trusted: an absolute path to its CA bundle.
-- `OMNESIS_ANSWER_TIMEOUT_MS` — only to change the default 240000; keep it
-  under the handler's `timeout_ms` (300000).
-
-### 5. Prove the integration answers before touching Guv
+Without the Omnesis CLI:
 
 ```sh
-curl -fsS -X POST "$OMNESIS_GATEWAY_URL/answer" \
-  -H "Authorization: Bearer $(cat "$OMNESIS_TOKEN_FILE")" \
-  -H 'Content-Type: application/json' \
-  -d '{"question":"Reply with exactly: Omnesis works","approval":"never"}'
+(umask 077; curl -sS --fail-with-body -X POST https://<gateway>:7600/devices/pair \
+  -H 'Content-Type: application/json' -d '{"pairingCode":"<code>"}' |
+  jq -r .token > ~/.config/omnesis/guv.token)
 ```
 
-Expect `"status":"released"`. A 403 with `ACCESS_LEVEL_REQUIRED` means the
-integration has no access level yet; a 401 means the token is not valid —
-re-pair. Do not continue until this succeeds.
-
-### 6. Load the handler and restart Guv
-
-With the user's approval, from the checkout:
+### 4. Prove the integration answers before touching Guv
 
 ```sh
-guv handler load handler.config.example.json
+gateway=https://<gateway>:7600
+token_file=$HOME/.config/omnesis/guv.token
+printf 'Authorization: Bearer %s\n' "$(cat "$token_file")" |
+  curl -sS --fail-with-body -H @- -X POST "$gateway/answer" \
+    -H 'Content-Type: application/json' \
+    -d '{"question":"Reply with exactly: Omnesis works","approval":"never"}'
+```
+
+`printf` is a shell builtin, so the token reaches curl on stdin, never on its
+command line. Expect `"status":"released"`. A 403 with
+`ACCESS_LEVEL_REQUIRED` means the integration has no access level yet; a 401
+means the token is not valid, so pair again. Do not continue until this
+succeeds.
+
+### 5. Configure and load the handler
+
+```sh
+cp handler.config.example.json handler.config.json
+```
+
+In `handler.config.json`, set `--gateway-url` and `--token-file` (an
+absolute path: the command runs without a shell). Add `--ca-file <absolute
+path>` for a gateway whose certificate is not publicly trusted. Then, with the
+user's approval:
+
+```sh
+guv handler load handler.config.json
 ```
 
 Restart the daemon (`systemctl --user restart guv.service`,
 `brew services restart guv`, or a foreground `guv run`), then check that
 `guv status` shows `handler ok`. `guv handler load` alone restarts nothing.
 
-### 7. Confirm from the Guv app
+### 6. Confirm from the Guv app
 
 Ask the user to send `Reply with exactly: Guv works` from the Guv app. Done
 when the app shows the reply. Every failure also arrives as a readable reply

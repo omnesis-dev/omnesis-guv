@@ -57,71 +57,74 @@ omnesis devices redeem <code> --gateway-url https://<gateway>:7600 \
   --save ~/.config/omnesis/guv.token
 ```
 
-Without the Omnesis CLI there, redeem with `curl` and keep the `token` field
-of the response in a mode-0600 file:
+Without the Omnesis CLI there, redeem with `curl` and keep only the token,
+without printing it:
 
 ```sh
-curl -X POST https://<gateway>:7600/devices/pair \
-  -H 'Content-Type: application/json' \
-  -d '{"pairingCode":"<code>","kind":"integration"}'
+(umask 077; curl -sS --fail-with-body -X POST https://<gateway>:7600/devices/pair \
+  -H 'Content-Type: application/json' -d '{"pairingCode":"<code>"}' |
+  jq -r .token > ~/.config/omnesis/guv.token)
 ```
+
+For a gateway whose certificate is not publicly trusted, add
+`--trust-fingerprint sha256:…` to the `omnesis` command or `--cacert <ca.pem>`
+to `curl`.
 
 The token carries only the `answer` scope. The gateway refuses to give an
 integration anything more, whatever it asks for.
 
-## Configure
+## Configure and load it into Guv
 
-The handler reads its configuration from the environment Guv runs it in:
-
-| Variable                    | Meaning                                                                                                                                   |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `OMNESIS_GATEWAY_URL`       | Required. The gateway address, for example `https://gateway.example.org:7600`. Plain `http` is accepted only for `localhost`.            |
-| `OMNESIS_TOKEN_FILE`        | Required. Absolute path of the token file. It is read for every Job, so replacing it rotates the token without restarting Guv.           |
-| `OMNESIS_CA_FILE`           | Absolute path of a PEM bundle to trust, for a gateway whose certificate is not publicly trusted (the gateway's own CA, for example).      |
-| `OMNESIS_ANSWER_TIMEOUT_MS` | How long one Job may take, retries included. Default `240000`. Keep it under the handler's `timeout_ms`, or Guv restarts the handler. |
-
-A configuration problem does not stop the handler: every Job replies with what
-is wrong until you fix it and restart Guv.
-
-With Guv under systemd, set these on the Guv service, for example in a
-drop-in created with `systemctl --user edit guv.service`:
-
-```ini
-[Service]
-Environment=OMNESIS_GATEWAY_URL=https://gateway.example.org:7600
-Environment=OMNESIS_TOKEN_FILE=%h/.config/omnesis/guv.token
-```
-
-## Load it into Guv
-
-From this checkout, load the handler and restart the daemon:
+Guv starts the handler with the command in its handler configuration, and the
+handler takes its settings from that command. Copy the example and fill in
+your gateway address and token file:
 
 ```sh
-guv handler load handler.config.example.json
+cp handler.config.example.json handler.config.json
+```
+
+| Flag                  | Meaning                                                                                                                                  |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `--gateway-url`       | Required. The gateway address, for example `https://gateway.example.org:7600`. Plain `http` only for this machine (`localhost`, `127.0.0.1`, `[::1]`). |
+| `--token-file`        | Required. Absolute path of the token file. It is read for every Job, so replacing it rotates the token without restarting Guv.          |
+| `--ca-file`           | Absolute path of a PEM bundle to trust, for a gateway whose certificate is not publicly trusted.                                         |
+| `--answer-timeout-ms` | How long one Job may take, retries included. Default `240000`. Keep it under `timeout_ms`, or Guv restarts the handler mid-answer.       |
+
+Paths must be absolute: Guv runs the command without a shell, so `~` is not
+expanded. `handler.config.json` is ignored by git.
+
+Then load it and restart the daemon:
+
+```sh
+guv handler load handler.config.json
 # restart Guv (systemctl --user restart guv.service, brew services restart guv, or guv run), then:
 guv status   # handler ok
 ```
 
 Guv resolves the file's relative `cwd` against the file itself, so the handler
-runs from this checkout. `bun` must be on the `PATH` Guv loads it with.
-`handler.config.example.json` gives each Job 300 seconds (`timeout_ms`) and
-runs four at once (`max_concurrency`).
+runs from this checkout; `bun` must be on the `PATH` Guv loads it with. The
+example gives each Job 300 seconds (`timeout_ms`) and runs two at once
+(`max_concurrency`), which is as many answers as the gateway makes at once for
+one integration.
+
+A wrong command does not stop the handler: every Job replies with what is
+wrong until you fix the configuration and load it again.
 
 ## How a Job is answered
 
 The handler asks one question per Job and uses the Job id as the gateway
-request id. The gateway keeps each request id as one durable task, so the
-handler can safely ask again after a dropped connection, while the gateway is
-still answering, or while its turn limit is full — each time it collects the
-answer already being made rather than starting a second one. A gateway that
-stays unreachable for 30 seconds is reported rather than waited on for the
-whole time budget. If the integration's access level changes while an answer
-is being made, the gateway withholds that answer and the handler asks once
-more under the new level.
+request id. The gateway keeps each request id as one task and never delivers
+two answers for it, so the handler asks again under the same id when the
+connection drops, while the answer is still being made, and while the gateway
+is momentarily full. A gateway that stays unreachable for 30 seconds is
+reported rather than waited on for the whole time budget. If the
+integration's access level changes while an answer is being made, the gateway
+withholds that answer and the handler asks once more under the new level.
 
 A short answer is shown whole. A longer one opens with its first paragraph and
 carries the whole answer as the expanded detail, shortened only if it would
-exceed Guv's 128 KiB result limit.
+exceed Guv's 128 KiB result limit. Details the gateway withheld are listed
+after the answer.
 
 ## Development
 
