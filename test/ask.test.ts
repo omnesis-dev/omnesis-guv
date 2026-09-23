@@ -151,7 +151,7 @@ describe("ask", () => {
     const { deps, requests, elapsed } = scripted([unreachable(), HANG, HANG, HANG, HANG, HANG, HANG]);
     const error = await ask("q", "job-7", 240_000, deps).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(GatewayUnreachableError);
-    expect(elapsed()).toBeLessThanOrEqual(OUTAGE_GIVE_UP_MS + OUTAGE_PROBE_MS);
+    expect(elapsed()).toBeLessThanOrEqual(OUTAGE_GIVE_UP_MS + 2 * OUTAGE_PROBE_MS);
     expect(requests.length).toBeGreaterThan(2);
   });
 
@@ -159,6 +159,20 @@ describe("ask", () => {
     // The probe reaches the recovered gateway, which starts the task and is still
     // answering when the probe gives up; the next probe finds it running.
     const { deps, requests } = scripted([unreachable(), HANG, inProgress(), inProgress(), RELEASED]);
+    expect(await ask("q", "job-7", 240_000, deps)).toEqual(RELEASED);
+    expect(new Set(requests.map((r) => r.clientRequestId))).toEqual(new Set(["guv_job-7"]));
+  });
+
+  test("a gateway that comes back late in an outage, and answers slowly, is not reported as down", async () => {
+    // Refused at 0, 1, 3, 7 and 15 seconds; back by the probe at 25 seconds, which
+    // starts the answer and goes silent past the outage limit while it is made.
+    const { deps, requests } = scripted([
+      ...Array.from({ length: 5 }, unreachable),
+      HANG,
+      inProgress(),
+      inProgress(),
+      RELEASED,
+    ]);
     expect(await ask("q", "job-7", 240_000, deps)).toEqual(RELEASED);
     expect(new Set(requests.map((r) => r.clientRequestId))).toEqual(new Set(["guv_job-7"]));
   });

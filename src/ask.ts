@@ -81,6 +81,7 @@ export async function ask(question: string, jobId: string, budgetMs: number, dep
   let reaskedAfterAccessChange = false;
   let outageSince: number | undefined;
   let outage: unknown;
+  let silentProbe = false;
   let waitingOn: DeadlineWait = "answer";
   for (;;) {
     const remaining = deadline - deps.now();
@@ -98,9 +99,16 @@ export async function ask(question: string, jobId: string, budgetMs: number, dep
       let error = caught;
       if (error === signal.reason) {
         if (attemptMs === remaining) throw new AnswerDeadlineError(budgetMs, probing ? "gateway" : "answer");
-        // A probe the gateway never answered: the outage goes on.
+        // One silent probe may have reached a gateway that is back and is now
+        // making the answer; probing again at once finds out, since that
+        // gateway answers a repeat straight away. Two in a row mean it is gone.
+        if (!silentProbe) {
+          silentProbe = true;
+          continue;
+        }
         error = outage;
       }
+      silentProbe = false;
       if (error instanceof AnswerHttpError && error.code === "ANSWER_ACCESS_CHANGED" && !reaskedAfterAccessChange) {
         // The integration's access level changed while the answer was being
         // made, so the gateway withheld it. The same request id asks again
