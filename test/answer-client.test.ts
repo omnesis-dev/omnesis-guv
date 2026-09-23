@@ -85,12 +85,10 @@ describe("AnswerClient.submit", () => {
 
   test("a redirect is refused, not followed", async () => {
     const error = await failure(
-      respond("", { status: 308, headers: { location: "http://elsewhere.example.org/answer" } }),
+      respond("", { status: 308, headers: { location: "http://elsewhere.example.org/answer?session=secret" } }),
     );
     expect(error).toBeInstanceOf(GatewayRedirectError);
-    expect((error as Error).message).toBe(
-      "The Omnesis gateway address redirects to http://elsewhere.example.org/answer.",
-    );
+    expect((error as Error).message).toBe("The Omnesis gateway address redirects to http://elsewhere.example.org.");
   });
 
   test("a network failure is unreachable, naming the address and the code but never the request", async () => {

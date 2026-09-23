@@ -123,6 +123,21 @@ describe("ask", () => {
     expect(requests).toHaveLength(4);
   });
 
+  test("waits out a gateway shutting down for a restart", async () => {
+    const { deps, requests } = scripted([
+      new AnswerHttpError(503, "GATEWAY_SHUTTING_DOWN", "Gateway is shutting down"),
+      unreachable(),
+      RELEASED,
+    ]);
+    expect(await ask("q", "job-7", 60_000, deps)).toEqual(RELEASED);
+    expect(requests).toHaveLength(3);
+  });
+
+  test("an access change resets what a later deadline reports", async () => {
+    const { deps } = scripted([unreachable(), accessChanged(), HANG]);
+    expect(await ask("q", "job-7", 20_000, deps).catch((e: unknown) => e)).toMatchObject({ waitingOn: "answer" });
+  });
+
   test("an attempt that hangs after the gateway went unreachable is reported as the gateway", async () => {
     const { deps } = scripted([unreachable(), HANG]);
     const error = await ask("q", "job-7", 20_000, deps).catch((e: unknown) => e);

@@ -10,7 +10,7 @@
     "test": "bun test",
     "typecheck": "tsc",
     "format": "prettier --write .",
-    "check": "tsc && prettier --check . && bun test"
+    "check": "bun run typecheck && prettier --check . && bun test"
   },
   "dependencies": {
     "zod": "3.25.76"

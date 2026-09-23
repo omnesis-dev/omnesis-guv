@@ -150,6 +150,19 @@ describe("errorReply", () => {
     expect(summary(new GatewayRedirectError("https://other.example.org/"))).toContain("--gateway-url");
     expect(summary(new InvalidAnswerResponseError())).toContain("--gateway-url points at the Omnesis gateway");
     expect(summary(new AnswerHttpError(401, "UNAUTHORIZED", "Unauthorized"))).toContain("/secure/guv.token");
+    expect(summary(new AnswerHttpError(403, "ANSWER_ACCESS_CHANGED", "access changed"))).toBe(
+      "This integration's access level changed again while Omnesis was answering. Ask again.",
+    );
+    expect(summary(new AnswerHttpError(429, "ANSWER_EGRESS_LIMIT", "This answer reached its release limit"))).toBe(
+      "This answer reached its release limit. Ask again to start a new answer.",
+    );
+    expect(summary(new AnswerHttpError(503, "GATEWAY_SHUTTING_DOWN", "Gateway is shutting down."))).toBe(
+      "The Omnesis gateway at https://gateway.example.org:7600 stayed unavailable (HTTP 503: Gateway is shutting down). " +
+        "Check that it is running and reachable from the Guv machine.",
+    );
+    expect(summary(new AnswerHttpError(502, undefined, "Bad Gateway"))).toContain(
+      "stayed unavailable (HTTP 502: Bad Gateway)",
+    );
     expect(summary(new AnswerHttpError(500, "INTERNAL", "boom"))).toBe("Omnesis could not answer (HTTP 500): boom.");
     expect(summary(new Error("unexpected"))).toBe("The Omnesis handler failed: unexpected.");
   });

@@ -12,7 +12,7 @@ import {
   InvalidAnswerResponseError,
   type AnswerResponse,
 } from "./answer-client.js";
-import { AnswerDeadlineError, type DeadlineWait } from "./ask.js";
+import { AnswerDeadlineError, isGatewayOutage, type DeadlineWait } from "./ask.js";
 import { JobFileError, type ConfigError, type HandlerConfig } from "./config.js";
 
 /** Longest answer shown whole as the compact summary; a longer one is also sent in full as the detail. */
@@ -71,6 +71,13 @@ export function errorReply(error: unknown, config: Pick<HandlerConfig, "gatewayU
   if (error instanceof GatewayUnreachableError) {
     return textReply(
       `${sentence(error.message)} Check that the gateway is running and reachable from the Guv machine.`,
+    );
+  }
+  if (error instanceof AnswerHttpError && isGatewayOutage(error)) {
+    // An outage whose last word was an HTTP answer: a proxy, or a gateway shutting down.
+    return textReply(
+      `The Omnesis gateway at ${config.gatewayUrl} stayed unavailable (HTTP ${error.status}: ${error.detail.trim().replace(/[.!?]+$/, "")}). ` +
+        "Check that it is running and reachable from the Guv machine.",
     );
   }
   if (error instanceof GatewayCertificateError) {

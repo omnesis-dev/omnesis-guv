@@ -52,11 +52,14 @@ export class GatewayCertificateError extends Error {
   }
 }
 
-/** The gateway address answers with a redirect, which is never followed with the token. */
+/**
+ * The gateway address answers with a redirect, which is never followed with
+ * the token. Only the target's origin is quoted: the reply leaves this machine.
+ */
 export class GatewayRedirectError extends Error {
   override readonly name = "GatewayRedirectError";
-  constructor(readonly location: string | null) {
-    super(`The Omnesis gateway address redirects${location ? ` to ${location}` : ""}.`);
+  constructor(targetOrigin: string | undefined) {
+    super(`The Omnesis gateway address redirects${targetOrigin ? ` to ${targetOrigin}` : ""}.`);
   }
 }
 
@@ -125,7 +128,7 @@ export class AnswerClient {
       throw new GatewayUnreachableError(this.options.gatewayUrl, code);
     }
     if (response.status >= 300 && response.status < 400) {
-      throw new GatewayRedirectError(response.headers.get("location"));
+      throw new GatewayRedirectError(originOf(response.headers.get("location"), this.options.gatewayUrl));
     }
     const payload = parseJson(body);
     if (!response.ok) {
@@ -161,6 +164,15 @@ export function parseAnswerResponse(payload: unknown): AnswerResponse {
       return { status, taskId, reason: payload.reason };
   }
   throw new InvalidAnswerResponseError();
+}
+
+function originOf(location: string | null, base: string): string | undefined {
+  if (!location) return undefined;
+  try {
+    return new URL(location, base).origin;
+  } catch {
+    return undefined;
+  }
 }
 
 function parseJson(text: string): unknown {

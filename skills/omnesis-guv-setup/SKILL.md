@@ -72,7 +72,7 @@ Without the Omnesis CLI:
 ```sh
 (umask 077; curl -sS --fail-with-body -X POST https://<gateway>:7600/devices/pair \
   -H 'Content-Type: application/json' -d '{"pairingCode":"<code>"}' |
-  jq -r .token > ~/.config/omnesis/guv.token)
+  jq -er .token > ~/.config/omnesis/guv.token)
 ```
 
 ### 4. Prove the integration answers before touching Guv
@@ -107,8 +107,8 @@ user's approval:
 guv handler load handler.config.json
 ```
 
-Restart the daemon (`systemctl --user restart guv.service`,
-`brew services restart guv`, or a foreground `guv run`), then check that
+Restart the daemon (`brew services restart guv`, a foreground `guv run`,
+or whatever service manager runs it), then check that
 `guv status` shows `handler ok`. `guv handler load` alone restarts nothing.
 
 ### 6. Confirm from the Guv app

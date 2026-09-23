@@ -20,6 +20,18 @@ export const UNREACHABLE_GIVE_UP_MS = 30_000;
 /** Proxy statuses that mean the gateway behind it is restarting, down, or slow to answer. */
 const PROXY_GAP_STATUSES: ReadonlySet<number> = new Set([502, 503, 504]);
 
+/**
+ * Whether a failure means the gateway itself is unavailable: unreachable, a
+ * proxy reporting it gone (an uncoded 502/503/504; the gateway's own errors
+ * always carry a code), or the gateway saying it is shutting down for a
+ * restart. The task, if it was created, is still there when the gateway is back.
+ */
+export function isGatewayOutage(error: unknown): boolean {
+  if (error instanceof GatewayUnreachableError) return true;
+  if (!(error instanceof AnswerHttpError)) return false;
+  return error.code === "GATEWAY_SHUTTING_DOWN" || (error.code === undefined && PROXY_GAP_STATUSES.has(error.status));
+}
+
 /** Refusals that clear on their own: the task is running, or the gateway is momentarily full. */
 const TRANSIENT_CODES: ReadonlySet<string> = new Set([
   "ANSWER_IN_PROGRESS",
@@ -34,7 +46,7 @@ export type DeadlineWait = "answer" | "capacity" | "gateway";
 export class AnswerDeadlineError extends Error {
   override readonly name = "AnswerDeadlineError";
   constructor(
-    readonly budgetMs: number,
+    budgetMs: number,
     readonly waitingOn: DeadlineWait,
   ) {
     super(`Omnesis did not answer within ${Math.round(budgetMs / 1000)} seconds.`);
@@ -79,11 +91,10 @@ export async function ask(question: string, jobId: string, budgetMs: number, dep
         // under the new level — once: a second change is left to the person.
         reaskedAfterAccessChange = true;
         unreachableSince = undefined;
+        waitingOn = "answer";
         continue;
       }
-      if (error instanceof GatewayUnreachableError || isProxyGap(error)) {
-        // A proxy answering for a gateway it cannot reach is an outage like any other;
-        // the task, if it was created, keeps running behind it.
+      if (isGatewayOutage(error)) {
         waitingOn = "gateway";
         unreachableSince ??= deps.now();
         if (deps.now() - unreachableSince >= UNREACHABLE_GIVE_UP_MS) throw error;
@@ -101,9 +112,4 @@ export async function ask(question: string, jobId: string, budgetMs: number, dep
     if (wait > 0) await deps.sleep(wait);
     delay = Math.min(delay * 2, MAX_RETRY_DELAY_MS);
   }
-}
-
-/** An uncoded 502/503/504: the gateway's own errors always carry a code, a proxy's do not. */
-function isProxyGap(error: unknown): boolean {
-  return error instanceof AnswerHttpError && error.code === undefined && PROXY_GAP_STATUSES.has(error.status);
 }

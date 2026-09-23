@@ -64,7 +64,7 @@ without printing it:
 ```sh
 (umask 077; curl -sS --fail-with-body -X POST https://<gateway>:7600/devices/pair \
   -H 'Content-Type: application/json' -d '{"pairingCode":"<code>"}' |
-  jq -r .token > ~/.config/omnesis/guv.token)
+  jq -er .token > ~/.config/omnesis/guv.token)
 ```
 
 For a gateway whose certificate is not publicly trusted, add
@@ -105,7 +105,7 @@ Then load it and restart the daemon:
 
 ```sh
 guv handler load handler.config.json
-# restart Guv (systemctl --user restart guv.service, brew services restart guv, or guv run), then:
+# restart Guv (brew services restart guv, a foreground guv run, or your own service manager), then:
 guv status   # handler ok
 ```
 
@@ -127,16 +127,16 @@ The handler asks one question per Job, under a gateway request id derived from
 the Job id. The gateway keeps each request id as one task and never delivers
 two answers for it, so the handler asks again under the same id when the
 connection drops, while the answer is still being made, while the gateway is
-momentarily full, and while a proxy in front of it reports it unavailable. A
-gateway that stays unreachable for 30 seconds is reported rather than waited
-on for the whole time budget. If the
-integration's access level changes while an answer is being made, the gateway
-withholds that answer and the handler asks once more under the new level.
+momentarily full or restarting, and while a proxy in front of it reports it
+unavailable. A gateway that stays unavailable for 30 seconds is reported
+rather than waited on for the whole time budget. If the integration's access
+level changes while an answer is being made, the gateway withholds that answer
+and the handler asks once more under the new level.
 
-A short answer is shown whole. A longer one opens with its first paragraph and
-carries the whole answer as the expanded detail, shortened only if it would
-exceed Guv's 128 KiB result limit. Details the gateway withheld are listed
-after the answer.
+A short answer is shown whole. A longer one opens with as many whole
+paragraphs as fit in 600 characters and carries the whole answer as the
+expanded detail, shortened only if it would exceed Guv's 128 KiB result limit.
+Details the gateway withheld are listed after the answer.
 
 ## Development
 
