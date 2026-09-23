@@ -6,7 +6,14 @@ import {
   type AnswerRequest,
   type AnswerResponse,
 } from "../src/answer-client.js";
-import { AnswerDeadlineError, ask, requestIdFor, OUTAGE_GIVE_UP_MS, type AskDeps } from "../src/ask.js";
+import {
+  AnswerDeadlineError,
+  ask,
+  OUTAGE_GIVE_UP_MS,
+  OUTAGE_PROBE_MS,
+  requestIdFor,
+  type AskDeps,
+} from "../src/ask.js";
 
 const RELEASED: AnswerResponse = { status: "released", taskId: "task_1", answer: "Yes." };
 
@@ -40,6 +47,7 @@ function scripted(outcomes: (AnswerResponse | Error | typeof HANG)[], attemptMs 
         requests.push(request);
         const deadline = deadlines.get(signal)!;
         if (outcomes[0] === HANG || clock + attemptMs >= deadline.at) {
+          if (outcomes[0] === HANG) outcomes.shift();
           clock = deadline.at;
           deadline.controller.abort(new DOMException("The operation timed out.", "TimeoutError"));
           throw signal.reason;
@@ -138,11 +146,27 @@ describe("ask", () => {
     expect(await ask("q", "job-7", 20_000, deps).catch((e: unknown) => e)).toMatchObject({ waitingOn: "answer" });
   });
 
-  test("an attempt still running at the deadline after an outage is reported as a slow answer", async () => {
-    // The gateway came back and accepted the question; it was answering, not down.
-    const { deps } = scripted([unreachable(), HANG]);
-    const error = await ask("q", "job-7", 20_000, deps).catch((e: unknown) => e);
-    expect(error).toMatchObject({ name: "AnswerDeadlineError", waitingOn: "answer" });
+  test("a gateway that went dark is reported once the outage reaches its limit, not after hanging to the deadline", async () => {
+    // Refused once, then every connection hangs: an asleep or disconnected machine.
+    const { deps, requests, elapsed } = scripted([unreachable(), HANG, HANG, HANG, HANG, HANG, HANG]);
+    const error = await ask("q", "job-7", 240_000, deps).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(GatewayUnreachableError);
+    expect(elapsed()).toBeLessThanOrEqual(OUTAGE_GIVE_UP_MS + OUTAGE_PROBE_MS);
+    expect(requests.length).toBeGreaterThan(2);
+  });
+
+  test("a gateway that comes back mid-outage still delivers the answer a probe started", async () => {
+    // The probe reaches the recovered gateway, which starts the task and is still
+    // answering when the probe gives up; the next probe finds it running.
+    const { deps, requests } = scripted([unreachable(), HANG, inProgress(), inProgress(), RELEASED]);
+    expect(await ask("q", "job-7", 240_000, deps)).toEqual(RELEASED);
+    expect(new Set(requests.map((r) => r.clientRequestId))).toEqual(new Set(["guv_job-7"]));
+  });
+
+  test("a deadline that falls during a probe is reported as the gateway", async () => {
+    const { deps } = scripted([unreachable(), HANG, HANG]);
+    const error = await ask("q", "job-7", 15_000, deps).catch((e: unknown) => e);
+    expect(error).toMatchObject({ name: "AnswerDeadlineError", waitingOn: "gateway" });
   });
 
   test("a deadline that falls during a pause after an outage is reported as the gateway", async () => {

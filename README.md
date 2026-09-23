@@ -129,8 +129,9 @@ the Job id. The gateway keeps each request id as one task and never delivers
 two answers for it, so the handler asks again under the same id when the
 connection drops, while the answer is still being made, while the gateway is
 momentarily full or restarting, and while a proxy in front of it reports it
-unavailable. A gateway that stays unavailable for 30 seconds is reported
-rather than waited on for the whole time budget. If the integration's access
+unavailable. While it is unavailable each attempt is a short probe, so a
+gateway that stays unavailable is reported after about 30 seconds rather than
+waited on for the whole time budget. If the integration's access
 level changes while an answer is being made, the gateway withholds that answer
 and the handler asks once more under the new level.
 

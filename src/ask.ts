@@ -18,6 +18,9 @@ const MAX_RETRY_DELAY_MS = 10_000;
  */
 export const OUTAGE_GIVE_UP_MS = 30_000;
 
+/** How long one attempt may take while the gateway is unavailable; see `ask`. */
+export const OUTAGE_PROBE_MS = 10_000;
+
 /** Proxy statuses that mean the gateway behind it is restarting, down, or slow to answer. */
 const PROXY_GAP_STATUSES: ReadonlySet<number> = new Set([502, 503, 504]);
 
@@ -77,16 +80,27 @@ export async function ask(question: string, jobId: string, budgetMs: number, dep
   let delay = FIRST_RETRY_DELAY_MS;
   let reaskedAfterAccessChange = false;
   let outageSince: number | undefined;
+  let outage: unknown;
   let waitingOn: DeadlineWait = "answer";
   for (;;) {
     const remaining = deadline - deps.now();
     if (remaining <= 0) throw new AnswerDeadlineError(budgetMs, waitingOn);
-    const signal = deps.timeout(remaining);
+    // During an outage every attempt is a short probe. A gateway that is back
+    // answers it at once — with the answer, or with 409 ANSWER_IN_PROGRESS for
+    // a task a previous probe started, which keeps running without the
+    // connection — while one that is still gone never answers it at all.
+    const probing = outageSince !== undefined;
+    const attemptMs = probing ? Math.min(remaining, OUTAGE_PROBE_MS) : remaining;
+    const signal = deps.timeout(attemptMs);
     try {
       return await deps.client.submit(request, signal);
-    } catch (error) {
-      // An attempt still running at the deadline had reached a gateway that was answering.
-      if (error === signal.reason) throw new AnswerDeadlineError(budgetMs, "answer");
+    } catch (caught) {
+      let error = caught;
+      if (error === signal.reason) {
+        if (attemptMs === remaining) throw new AnswerDeadlineError(budgetMs, probing ? "gateway" : "answer");
+        // A probe the gateway never answered: the outage goes on.
+        error = outage;
+      }
       if (error instanceof AnswerHttpError && error.code === "ANSWER_ACCESS_CHANGED" && !reaskedAfterAccessChange) {
         // The integration's access level changed while the answer was being
         // made, so the gateway withheld it. The same request id asks again
@@ -98,6 +112,7 @@ export async function ask(question: string, jobId: string, budgetMs: number, dep
       }
       if (isGatewayOutage(error)) {
         waitingOn = "gateway";
+        outage = error;
         outageSince ??= deps.now();
         if (deps.now() - outageSince >= OUTAGE_GIVE_UP_MS) throw error;
       } else if (error instanceof AnswerHttpError && error.code !== undefined && TRANSIENT_CODES.has(error.code)) {
@@ -109,7 +124,7 @@ export async function ask(question: string, jobId: string, budgetMs: number, dep
     }
     const now = deps.now();
     let wait = Math.min(delay, deadline - now);
-    // Try once more exactly when the outage reaches its limit, not a full pause later.
+    // Probe once more exactly when the outage reaches its limit, not a full pause later.
     if (outageSince !== undefined) wait = Math.min(wait, outageSince + OUTAGE_GIVE_UP_MS - now);
     if (wait > 0) await deps.sleep(wait);
     delay = Math.min(delay * 2, MAX_RETRY_DELAY_MS);
