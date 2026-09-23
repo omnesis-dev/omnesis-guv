@@ -1,14 +1,23 @@
 {
   "name": "omnesis-guv",
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "private": true,
   "license": "MIT",
   "description": "Guv handler that answers Jobs through the Omnesis /answer API",
   "type": "module",
   "scripts": {
+    "sync-sdk": "scripts/sync-guv-sdk.sh",
     "test": "bun test",
-    "handler": "bun src/handler.ts"
+    "typecheck": "tsc",
+    "format": "prettier --write .",
+    "check": "bun run typecheck && prettier --check . && bun test"
   },
   "dependencies": {
     "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "prettier": "3.9.9",
+    "typescript": "7.0.2"
   }
 }

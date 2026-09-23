@@ -1,194 +1,202 @@
 // SPDX-License-Identifier: MIT
-// Minimal typed HTTPS client for the Omnesis privacy-brokered `/answer`
-// boundary. It mirrors the contract of `@omnesis/gateway-client`'s
-// `AnswerHttpClient` (POST /answer, GET /answer/tasks/:id, Bearer auth)
-// without depending on the Omnesis monorepo, which is not published to a
-// package registry. Any behavioral drift from the gateway's answer boundary
-// should be fixed here and covered by `test/answer-client.test.ts`.
+// One call to the Omnesis gateway's `POST /answer`: send a question, get back
+// the gateway's verdict. The gateway keeps each request id as one durable task
+// and never delivers two answers for it, which is what lets `ask.ts` post the
+// same request again after a failure.
 
-export type AnswerStatus =
-  | "released"
-  | "released_with_reductions"
-  | "approval_required"
-  | "denied";
+/** The gateway's `/answer` question limit, in UTF-16 code units. */
+export const MAX_QUESTION_LENGTH = 10_000;
 
-export interface AnswerResponse {
-  status: AnswerStatus;
-  answer?: string;
-  reductions?: string[];
-  reason?: string | null;
-  approvalId?: string | null;
-  workflowId: string;
-  conversationId: string;
-  taskId: string;
-}
+/** The gateway's verdict on one question. */
+export type AnswerResponse =
+  | { status: "released"; taskId: string; answer: string }
+  | { status: "released_with_reductions"; taskId: string; answer: string; reductions: string[] }
+  | { status: "approval_required"; taskId: string; approvalId: string }
+  /** `reason` is deliberately coarse — findings never cross the boundary — and may gain values. */
+  | { status: "denied"; taskId: string; reason: string };
 
-export interface SubmitAnswerInput {
+export interface AnswerRequest {
   question: string;
   clientRequestId: string;
-  conversationId?: string;
-  workflowId?: string;
-  workflowName?: string;
-  workflowPurpose?: string;
-  /** Non-interactive default: never hold for approval. */
-  approval?: "allow" | "never";
 }
 
-export interface AnswerRequestOptions {
-  signal?: AbortSignal;
-}
-
-export interface AnswerClientOptions {
-  baseUrl: string;
-  token: string;
-  fetchImpl?: typeof fetch;
-}
-
-/** A typed HTTP failure from the public Answer boundary. */
+/** The gateway answered with an error status; `code` is its machine-readable error code. */
 export class AnswerHttpError extends Error {
+  override readonly name = "AnswerHttpError";
   constructor(
     readonly status: number,
+    readonly code: string | undefined,
     readonly detail: string,
   ) {
-    super(`Omnesis answer request failed (HTTP ${status}): ${detail}`);
-    this.name = "AnswerHttpError";
+    super(`Omnesis answered HTTP ${status}${code ? ` ${code}` : ""}: ${detail}`);
   }
 }
 
-/** A malformed success payload is never safe to forward. */
+/**
+ * The request, or its response, never made it across the network. The
+ * message names only the failure's code: a raw fetch message can quote the
+ * request, token included.
+ */
+export class GatewayUnreachableError extends Error {
+  override readonly name = "GatewayUnreachableError";
+  constructor(gatewayUrl: string, code: string | undefined) {
+    super(`Cannot reach Omnesis at ${gatewayUrl}${code ? ` (${code})` : ""}.`);
+  }
+}
+
+/** The gateway's certificate is not trusted; retrying cannot help. */
+export class GatewayCertificateError extends Error {
+  override readonly name = "GatewayCertificateError";
+  constructor(readonly code: string) {
+    super(`The Omnesis gateway's certificate is not trusted (${code}).`);
+  }
+}
+
+/**
+ * The gateway address answers with a redirect, which is never followed with
+ * the token. Only the target's origin is quoted: the reply leaves this machine.
+ */
+export class GatewayRedirectError extends Error {
+  override readonly name = "GatewayRedirectError";
+  constructor(targetOrigin: string | undefined) {
+    super(`The Omnesis gateway address redirects${targetOrigin ? ` to ${targetOrigin}` : ""}.`);
+  }
+}
+
+/** A success response that does not have the documented shape is never forwarded. */
 export class InvalidAnswerResponseError extends Error {
+  override readonly name = "InvalidAnswerResponseError";
   constructor() {
-    super("Gateway returned a malformed Answer response.");
-    this.name = "InvalidAnswerResponseError";
+    super("Omnesis answered in a form this handler does not understand.");
   }
 }
 
-const STATUSES: ReadonlySet<string> = new Set([
-  "released",
-  "released_with_reductions",
-  "approval_required",
-  "denied",
+/** The slice of `fetch` the client uses; Bun's `fetch` takes `tls` for a private CA. */
+export type Fetch = (url: string, init: RequestInit & { tls?: { ca: string } }) => Promise<Response>;
+
+export interface AnswerClientOptions {
+  gatewayUrl: string;
+  token: string;
+  /** PEM bundle to trust for the gateway's certificate. */
+  ca?: string | undefined;
+  fetchImpl?: Fetch;
+}
+
+/** Certificate failures as Bun's `fetch` reports them. */
+const CERTIFICATE_ERRORS: ReadonlySet<string> = new Set([
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+  "CERT_HAS_EXPIRED",
+  "CERT_NOT_YET_VALID",
+  "ERR_TLS_CERT_ALTNAME_INVALID",
 ]);
+
+export class AnswerClient {
+  private readonly fetchImpl: Fetch;
+
+  constructor(private readonly options: AnswerClientOptions) {
+    this.fetchImpl = options.fetchImpl ?? fetch;
+  }
+
+  async submit(request: AnswerRequest, signal: AbortSignal): Promise<AnswerResponse> {
+    let response: Response;
+    let body: string;
+    try {
+      response = await this.fetchImpl(`${this.options.gatewayUrl}/answer`, {
+        method: "POST",
+        signal,
+        // `/answer` never redirects; following one would send the token on.
+        redirect: "manual",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.options.token}`,
+        },
+        // A Guv Job has nobody to approve a held answer, so the gateway
+        // never holds one for approval.
+        body: JSON.stringify({ ...request, approval: "never" }),
+        ...(this.options.ca ? { tls: { ca: this.options.ca } } : {}),
+      });
+      // Read inside the transport guard: a connection lost mid-body is a
+      // dropped connection like any other.
+      body = await response.text();
+    } catch (error) {
+      if (signal.aborted) throw signal.reason;
+      const code = errorCode(error);
+      if (code && CERTIFICATE_ERRORS.has(code)) throw new GatewayCertificateError(code);
+      throw new GatewayUnreachableError(this.options.gatewayUrl, code);
+    }
+    if (response.status >= 300 && response.status < 400) {
+      throw new GatewayRedirectError(originOf(response.headers.get("location"), this.options.gatewayUrl));
+    }
+    const payload = parseJson(body);
+    if (!response.ok) {
+      const envelope = isRecord(payload) ? payload : {};
+      throw new AnswerHttpError(
+        response.status,
+        typeof envelope.code === "string" ? envelope.code : undefined,
+        typeof envelope.error === "string" && envelope.error.trim()
+          ? envelope.error.trim()
+          : response.statusText || "no detail given",
+      );
+    }
+    return parseAnswerResponse(payload);
+  }
+}
+
+export function parseAnswerResponse(payload: unknown): AnswerResponse {
+  if (!isRecord(payload)) throw new InvalidAnswerResponseError();
+  const { status, taskId } = payload;
+  if (typeof taskId !== "string" || !taskId) throw new InvalidAnswerResponseError();
+  switch (status) {
+    case "released":
+      if (typeof payload.answer !== "string") break;
+      return { status, taskId, answer: payload.answer };
+    case "released_with_reductions":
+      if (typeof payload.answer !== "string" || !isStringArray(payload.reductions)) break;
+      return { status, taskId, answer: payload.answer, reductions: payload.reductions };
+    case "approval_required":
+      if (typeof payload.approvalId !== "string" || !payload.approvalId) break;
+      return { status, taskId, approvalId: payload.approvalId };
+    case "denied":
+      if (typeof payload.reason !== "string") break;
+      return { status, taskId, reason: payload.reason };
+  }
+  throw new InvalidAnswerResponseError();
+}
+
+function originOf(location: string | null, base: string): string | undefined {
+  if (!location) return undefined;
+  try {
+    return new URL(location, base).origin;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+/** A fetch failure's code, from the error or the cause it wraps. */
+function errorCode(error: unknown): string | undefined {
+  for (let current = error, depth = 0; current && depth < 3; depth++) {
+    if (typeof current !== "object") return undefined;
+    if ("code" in current && typeof current.code === "string") return current.code;
+    current = "cause" in current ? current.cause : undefined;
+  }
+  return undefined;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function optionalString(value: unknown): string | undefined {
-  return typeof value === "string" ? value : undefined;
-}
-
-export function parseAnswerResponse(payload: unknown): AnswerResponse {
-  if (!isRecord(payload)) throw new InvalidAnswerResponseError();
-  const { status } = payload;
-  if (typeof status !== "string" || !STATUSES.has(status)) {
-    throw new InvalidAnswerResponseError();
-  }
-  const workflowId = optionalString(payload.workflowId);
-  const conversationId = optionalString(payload.conversationId);
-  const taskId = optionalString(payload.taskId);
-  if (!workflowId || !conversationId || !taskId) {
-    throw new InvalidAnswerResponseError();
-  }
-  let reductions: string[] | undefined;
-  if (payload.reductions !== undefined) {
-    if (!Array.isArray(payload.reductions) || !payload.reductions.every((r) => typeof r === "string")) {
-      throw new InvalidAnswerResponseError();
-    }
-    reductions = payload.reductions as string[];
-  }
-  const reason =
-    payload.reason === null || payload.reason === undefined
-      ? undefined
-      : optionalString(payload.reason) ?? undefined;
-  const approvalId =
-    payload.approvalId === null || payload.approvalId === undefined
-      ? undefined
-      : optionalString(payload.approvalId) ?? undefined;
-  return {
-    status: status as AnswerStatus,
-    answer: optionalString(payload.answer),
-    reductions,
-    reason,
-    approvalId,
-    workflowId,
-    conversationId,
-    taskId,
-  };
-}
-
-/**
- * Minimal, cancellation-aware client for the gateway's `/answer` boundary.
- * It deliberately stays thin: no retries (the caller owns cancellation and
- * idempotency via `clientRequestId`), one request per call.
- */
-export class AnswerClient {
-  private readonly baseUrl: string;
-  private readonly token: string;
-  private readonly fetchImpl: typeof fetch;
-
-  constructor(options: AnswerClientOptions) {
-    if (!options.token) throw new Error("AnswerClient requires a token.");
-    this.baseUrl = options.baseUrl.replace(/\/+$/, "");
-    this.token = options.token;
-    this.fetchImpl = options.fetchImpl ?? fetch;
-  }
-
-  async submit(
-    input: SubmitAnswerInput,
-    options: AnswerRequestOptions = {},
-  ): Promise<AnswerResponse> {
-    if (!input.question.trim()) throw new Error("submit requires a non-empty question.");
-    if (!input.clientRequestId.trim()) throw new Error("submit requires a clientRequestId.");
-    return this.request("/answer", {
-      method: "POST",
-      signal: options.signal,
-      body: JSON.stringify({
-        question: input.question,
-        clientRequestId: input.clientRequestId,
-        ...(input.conversationId ? { conversationId: input.conversationId } : {}),
-        ...(input.workflowId ? { workflowId: input.workflowId } : {}),
-        ...(input.workflowName ? { workflowName: input.workflowName } : {}),
-        ...(input.workflowPurpose ? { workflowPurpose: input.workflowPurpose } : {}),
-        approval: input.approval ?? "never",
-      }),
-    });
-  }
-
-  async getTask(taskId: string, options: AnswerRequestOptions = {}): Promise<AnswerResponse> {
-    if (!taskId.trim()) throw new Error("getTask requires a task id.");
-    return this.request(`/answer/tasks/${encodeURIComponent(taskId)}`, {
-      signal: options.signal,
-    });
-  }
-
-  private async request(path: string, init: RequestInit): Promise<AnswerResponse> {
-    let response: Response;
-    try {
-      response = await this.fetchImpl(`${this.baseUrl}${path}`, {
-        ...init,
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.token}`,
-          "User-Agent": "omnesis-guv-handler",
-          ...init.headers,
-        },
-      });
-    } catch (error) {
-      throw new Error(
-        `Cannot reach the Omnesis gateway at ${this.baseUrl}: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-    const payload: unknown = await response.json().catch(() => null);
-    if (!response.ok) {
-      const detail =
-        isRecord(payload) && typeof payload.error === "string"
-          ? payload.error
-          : isRecord(payload) && typeof payload.message === "string"
-            ? payload.message
-            : response.statusText || "request failed";
-      throw new AnswerHttpError(response.status, detail);
-    }
-    return parseAnswerResponse(payload);
-  }
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
