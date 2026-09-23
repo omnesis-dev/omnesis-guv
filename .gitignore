@@ -1,7 +1,5 @@
 node_modules/
-bun.lock
-bun.lockb
+.guv-sdk/
+.guv-sdk.tmp/
 *.token
-.env
-.env.*
-!.env.example
+.guv-handler.*

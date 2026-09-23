@@ -1,93 +1,137 @@
 # omnesis-guv
 
-A [Guv](https://guv.sh) handler that answers every Job through the Omnesis
-`/answer` API. Talk to Guv from the app (or a ring that routes to Guv) and
-Omnesis — your indexed corpus — produces the reply.
+A [Guv](https://guv.sh) handler that answers every Job with
+[Omnesis](https://omnesis.dev): talk to Guv, and Omnesis answers from your
+indexed data through its `/answer` API.
 
-Every outcome, including failures, is returned as user-visible text: an
-expired token or a down gateway shows up in the app as an explanation of
-what happened and how to re-pair the device, never as a silent failure.
+The handler connects to your gateway as an Omnesis **integration**: a device
+that can only ask questions. What its answers may draw on — which sources, and
+whether a privacy policy reviews them before they leave the gateway — is the
+access level you choose for it in the Omnesis portal, and you can change it
+there at any time without touching this handler.
 
-## Layout
+Every Job ends in text you can read in the Guv app. When there is no answer,
+the reply says why and what to do: a revoked token, an integration without an
+access level, a gateway that is down, an answer the privacy policy withheld.
 
-- `src/handler.ts` — the Guv handler (`serveHandler` wiring).
-- `src/answer-client.ts` — minimal typed HTTPS client for `POST /answer` +
-  `GET /answer/tasks/:id`. Vendored (no monorepo dependency) because
-  `@omnesis/gateway-client` is not on a package registry; it mirrors that
-  client's contract.
-- `src/config.ts` — env-based config, token resolved lazily per Job.
-- `src/outcome.ts` — gateway four-state response → Guv summary text.
-- `skills/omnesis-guv-setup/SKILL.md` — Claude Code skill: point an agent at
-  it and it performs the whole setup + pairing below.
-- `handler.config.example.json` — template for `guv handler load`.
+## Requirements
 
-## Setup
+- Guv, with its own pairing healthy: `guv status` shows `api ok` and `auth ok`.
+- [Bun](https://bun.sh).
+- An Omnesis gateway that supports integrations, reachable from the Guv machine.
 
-Prerequisites: Guv installed with healthy Familiar pairing (`guv status`
-shows `api ok`, `auth ok`), Bun, and a reachable Omnesis gateway serving
-`/answer`.
+## Install
 
 ```sh
+git clone https://github.com/omnesis-dev/omnesis-guv.git
+cd omnesis-guv
 bun install
-# Attach the Guv handler SDK matching the installed Guv release:
-bun add "@familiar/guv-handler-sdk@file:$(brew --prefix guv)/share/guv/sdk"
-# ...or for direct-archive installs:
-bun add "@familiar/guv-handler-sdk@file:$HOME/.local/share/guv/sdk"
+bun run sync-sdk
 ```
 
-Pair a dedicated least-privilege device (on the gateway machine — note this
-is `--kind cli`, not `--kind agent`, which the gateway locks to the
-subscription scope):
+`bun run sync-sdk` copies the handler SDK that ships with your Guv into
+`.guv-sdk/` (it is not published to a registry). Run it again whenever you
+upgrade Guv: the SDK must match the daemon.
+
+## Pair the integration
+
+Pairing from the portal chooses the access level in the same step. On the
+portal's **Settings → Devices** page, choose **Pair device**, then:
+
+1. **Kind:** Integration.
+2. **Name:** what it is, for example `Guv`.
+3. **Access level:** the level whose Answer permission Guv's questions use. It
+   decides which sources answers may draw on and whether they are reviewed
+   under a privacy policy. Create or edit levels on **Settings → Access**.
+
+You can also mint the code from the gateway machine with
+`omnesis devices pair --kind integration --name Guv`; the integration then has
+no access level, and its questions are refused until you choose one on its
+card on the Devices page.
+
+Redeem the code on the Guv machine, saving the token to a file only you can
+read:
 
 ```sh
-omnesis devices pair --kind cli --scopes answer
-omnesis devices redeem <code> --gateway-url https://<gateway-host>:7600 \
-  --save ~/.config/omnesis/guv-handler.token
+omnesis devices redeem <code> --gateway-url https://<gateway>:7600 \
+  --save ~/.config/omnesis/guv.token
 ```
 
-Configure the daemon environment (`src/config.ts` documents all knobs):
+Without the Omnesis CLI there, redeem with `curl` and keep the `token` field
+of the response in a mode-0600 file:
 
 ```sh
-export OMNESIS_GATEWAY_URL=https://<gateway-host>:7600
-export OMNESIS_TOKEN_FILE=~/.config/omnesis/guv-handler.token
-# Loopback + self-signed cert only:
-export OMNESIS_INSECURE_TLS=1
+curl -X POST https://<gateway>:7600/devices/pair \
+  -H 'Content-Type: application/json' \
+  -d '{"pairingCode":"<code>","kind":"integration"}'
 ```
 
-Smoke-test Omnesis directly (step 5 of the skill), then install:
+The token carries only the `answer` scope. The gateway refuses to give an
+integration anything more, whatever it asks for.
 
-```sh
-# set "cwd" to this checkout, then:
-guv handler load <config>
-# restart the daemon, then:
-guv status   # must show: handler ok
+## Configure
+
+The handler reads its configuration from the environment Guv runs it in:
+
+| Variable                    | Meaning                                                                                                                                   |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `OMNESIS_GATEWAY_URL`       | Required. The gateway address, for example `https://gateway.example.org:7600`. Plain `http` is accepted only for `localhost`.            |
+| `OMNESIS_TOKEN_FILE`        | Required. Absolute path of the token file. It is read for every Job, so replacing it rotates the token without restarting Guv.           |
+| `OMNESIS_CA_FILE`           | Absolute path of a PEM bundle to trust, for a gateway whose certificate is not publicly trusted (the gateway's own CA, for example).      |
+| `OMNESIS_ANSWER_TIMEOUT_MS` | How long one Job may take, retries included. Default `240000`. Keep it under the handler's `timeout_ms`, or Guv restarts the handler. |
+
+A configuration problem does not stop the handler: every Job replies with what
+is wrong until you fix it and restart Guv.
+
+With Guv under systemd, set these on the Guv service, for example in a
+drop-in created with `systemctl --user edit guv.service`:
+
+```ini
+[Service]
+Environment=OMNESIS_GATEWAY_URL=https://gateway.example.org:7600
+Environment=OMNESIS_TOKEN_FILE=%h/.config/omnesis/guv.token
 ```
 
-Or hand the whole procedure to an agent via
-`skills/omnesis-guv-setup/SKILL.md`.
+## Load it into Guv
 
-## Troubleshooting
-
-- `Cannot find package 'zod'` at handler startup: Bun resolves the
-  file:-installed SDK by real path, outside this checkout. Keep `zod`
-  (pinned in `package.json`) installed here and launch with
-  `NODE_PATH=<checkout>/node_modules` — the systemd unit in the setup
-  skill does this.
-- `guv status` shows `handler ok` but the app reports failures: every
-  handler-side failure is returned as visible text naming the cause, so
-  read the reply — a 401/403 reply walks through re-pairing.
-- `auth FAILED ... 401`: the Familiar pairing, independent of Omnesis.
-  Run `guv setup` (may need the phone app) before any Job can arrive.
-
-## Tests
+From this checkout, load the handler and restart the daemon:
 
 ```sh
+guv handler load handler.config.example.json
+# restart Guv (systemctl --user restart guv.service, brew services restart guv, or guv run), then:
+guv status   # handler ok
+```
+
+Guv resolves the file's relative `cwd` against the file itself, so the handler
+runs from this checkout. `bun` must be on the `PATH` Guv loads it with.
+`handler.config.example.json` gives each Job 300 seconds (`timeout_ms`) and
+runs four at once (`max_concurrency`).
+
+## How a Job is answered
+
+The handler asks one question per Job and uses the Job id as the gateway
+request id. The gateway keeps each request id as one durable task, so the
+handler can safely ask again after a dropped connection, while the gateway is
+still answering, or while its turn limit is full — each time it collects the
+answer already being made rather than starting a second one. A gateway that
+stays unreachable for 30 seconds is reported rather than waited on for the
+whole time budget. If the integration's access level changes while an answer
+is being made, the gateway withholds that answer and the handler asks once
+more under the new level.
+
+A short answer is shown whole. A longer one opens with its first paragraph and
+carries the whole answer as the expanded detail, shortened only if it would
+exceed Guv's 128 KiB result limit.
+
+## Development
+
+```sh
+bun run sync-sdk    # once, and after upgrading Guv
 bun test
+bun run typecheck
 ```
 
-Pure modules only (`answer-client`, `outcome`); no live gateway, no model
-inference. The handler entrypoint needs the Guv SDK installed (see above)
-but is intentionally thin.
+The tests stub the gateway; they never reach a real one.
 
 ## License
 

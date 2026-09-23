@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2024",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2024"],
+    "types": ["bun"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "paths": {
+      "@familiar/guv-handler-sdk": ["./.guv-sdk/index.ts"],
+      "@familiar/guv-handler-sdk/process": ["./.guv-sdk/process.ts"]
+    }
+  },
+  "include": ["src", "test"]
+}
